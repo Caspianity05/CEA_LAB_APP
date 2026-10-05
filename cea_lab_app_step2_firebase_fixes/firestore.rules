@@ -1,0 +1,92 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LabTrack — Cloud Firestore security rules
+//
+// Roles:
+//   • student  — has a doc in /students keyed by their Auth UID
+//   • staff    — has a doc in /staff keyed by their Auth UID, with role:
+//                  'admin' | 'staff' | 'viewer'
+//   • viewer   — staff member with role == 'viewer' (read-only; e.g. the
+//                Supervising Minister). Cannot write anything.
+//
+// Authorisation is enforced server-side here so the client cannot bypass it.
+// ─────────────────────────────────────────────────────────────────────────────
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isStaff() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/staff/$(request.auth.uid));
+    }
+    // A "manager" is any staff member who is not a viewer (admin or staff).
+    function isManager() {
+      return isStaff() &&
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.role != 'viewer';
+    }
+
+    // Public lookup so a student can resolve their student number → email
+    // BEFORE authenticating. Holds only {email, uid}; nothing sensitive.
+    match /student_lookup/{studentNumber} {
+      allow read:   if true;
+      allow create: if signedIn();
+      allow update, delete: if false;
+    }
+
+    // Student profiles. A student may read/create/update only their own doc,
+    // but may NOT change their own hold/penalty fields. Staff may read all;
+    // managers may write (e.g. to place or lift a hold).
+    match /students/{uid} {
+      allow read:   if request.auth.uid == uid || isStaff();
+      allow create: if request.auth.uid == uid;
+      allow update: if isManager()
+        || (request.auth.uid == uid
+            && request.resource.data.hold == resource.data.hold
+            && request.resource.data.hold_reason == resource.data.hold_reason);
+      allow delete: if isManager();
+    }
+
+    // Staff/admin/viewer accounts are provisioned out-of-band (Firebase console
+    // or an admin tool); the app never writes them.
+    match /staff/{uid} {
+      allow read:  if request.auth.uid == uid || isStaff();
+      allow write: if false;
+    }
+
+    // Equipment is readable by any signed-in user; only managers may change it.
+    match /equipment/{id} {
+      allow read:   if signedIn();
+      allow create: if isManager();
+      allow update: if isManager();
+      allow delete: if isManager();
+    }
+
+    // Borrow transactions: a student creates and reads their own; staff read all;
+    // only managers may approve/reject/return (update).
+    match /borrow_transactions/{id} {
+      allow read:   if isStaff()
+        || (signedIn() && resource.data.student_id == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.student_id == request.auth.uid;
+      allow update: if isManager();
+      allow delete: if false;
+    }
+
+    // Damage reports: any signed-in user may file one; only staff may read;
+    // only managers may triage (update).
+    match /damage_reports/{id} {
+      allow read:   if isStaff();
+      allow create: if signedIn();
+      allow update: if isManager();
+      allow delete: if false;
+    }
+
+    // Deny everything not explicitly matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

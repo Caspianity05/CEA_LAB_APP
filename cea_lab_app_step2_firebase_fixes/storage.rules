@@ -1,0 +1,29 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LabTrack — Firebase Storage security rules
+//
+// Equipment images live under equipment_images/. Any signed-in user may view
+// them (students see them in the catalog); only staff who are not viewers may
+// upload or replace them.
+// ─────────────────────────────────────────────────────────────────────────────
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isManager() {
+      return request.auth != null
+        && firestore.exists(/databases/(default)/documents/staff/$(request.auth.uid))
+        && firestore.get(/databases/(default)/documents/staff/$(request.auth.uid)).data.role != 'viewer';
+    }
+
+    match /equipment_images/{file} {
+      allow read:  if request.auth != null;
+      allow write: if isManager();
+    }
+
+    // Deny everything else.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
