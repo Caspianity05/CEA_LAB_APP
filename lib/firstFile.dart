@@ -1,30 +1,86 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_storage/firebase_storage.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'firebase_options.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ⚠️ DEMO MODE — set this to `false` before the final defense / production.
+// DEMO MODE — CLOSED as of 2026-08-02.
 //
-// When true, account sign-up accepts ANY email address (not just @neu.edu.ph)
-// and the email-verification step is skipped, so you can create one demo
-// student per program without real NEU mailboxes. It does NOT affect the
-// Firestore security rules — only these two convenience gates in the app.
+// While true, account sign-up accepted ANY email address (not just @neu.edu.ph)
+// and the email-verification step was skipped, so one demo student per program
+// could be made without real NEU mailboxes. Now false, so registration requires
+// an @neu.edu.ph address and Firebase sends a confirmation link that must be
+// clicked before the account can sign in. It does NOT affect the Firestore
+// security rules — only these convenience gates in the app.
 // ─────────────────────────────────────────────────────────────────────────────
-const bool kDemoMode = true;
+const bool kDemoMode = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grandfather clause for the accounts made while demo mode was open.
+//
+// Those accounts were never sent a verification link, so Firebase reports
+// `emailVerified == false` for every one of them — and their addresses are not
+// @neu.edu.ph mailboxes anyone can actually receive mail at. Without this,
+// flipping kDemoMode to false would lock all of them out permanently.
+//
+// So: an account whose Firestore profile was created BEFORE this instant skips
+// the verification gate. Anything created after it must verify, which is what
+// closes sign-up to new dummy accounts. A profile with no `created_at` at all
+// is also treated as pre-existing — those predate the field entirely.
+//
+// This only relaxes a client-side convenience gate; the security rules are
+// unchanged and never trusted email verification in the first place.
+// ─────────────────────────────────────────────────────────────────────────────
+final DateTime kLegacyAccountCutoff = DateTime.utc(2026, 8, 3);
+
+/// True if [profile] belongs to an account created before demo mode was closed.
+bool _isLegacyAccount(Map<String, dynamic>? profile) {
+  final ts = profile?['created_at'];
+  if (ts is! Timestamp) return true; // missing/unset → predates the field
+  return ts.toDate().isBefore(kLegacyAccountCutoff);
+}
 
 // ─── Firebase Service ─────────────────────────────────────────────────────────
 class ApiService {
   static final _auth = FirebaseAuth.instance;
   static final _db   = FirebaseFirestore.instance;
+
+  // Convert any thrown error into a message that is safe to show users. Raw
+  // exceptions (e.g. "[cloud_firestore/permission-denied] …") leak
+  // implementation details, so map the common cases and keep the rest generic.
+  static String _friendlyError(Object e) {
+    if (e is FirebaseAuthException) {
+      return e.message ?? 'Authentication error. Please try again.';
+    }
+    if (e is FirebaseException) {
+      switch (e.code) {
+        case 'permission-denied':
+          return 'You do not have permission to do that.';
+        // Cloud Storage reports a rules refusal as 'unauthorized' rather than
+        // 'permission-denied'.
+        case 'unauthorized':
+          return 'You do not have permission to do that. '
+              'If this is a photo upload, check that the Storage rules are published.';
+        case 'unauthenticated':
+          return 'Your session has expired. Please sign in again.';
+        case 'unavailable':
+          return 'Cannot reach the server. Check your internet connection.';
+        case 'deadline-exceeded':
+          return 'The request timed out. Please try again.';
+        default:
+          return 'Something went wrong. Please try again.';
+      }
+    }
+    if (e is SocketException) return 'No internet connection.';
+    return 'Something went wrong. Please try again.';
+  }
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   static Future<Map<String, dynamic>> login(
@@ -42,14 +98,18 @@ class ApiService {
         final email = lookup.data()!['email'] as String;
         await _auth.signInWithEmailAndPassword(email: email, password: password);
         final uid = _auth.currentUser!.uid;
-        if (!kDemoMode && _auth.currentUser?.emailVerified != true) {
-          await _auth.signOut();
-          return {'success': false, 'message': 'email_not_verified', 'email': email};
-        }
+        // Profile is read BEFORE the verification gate: the grandfather check
+        // needs `created_at`, so the gate cannot run until the doc is in hand.
         final doc = await _db.collection('students').doc(uid).get();
         if (!doc.exists) {
           await _auth.signOut();
           return {'success': false, 'message': 'Student profile not found.'};
+        }
+        if (!kDemoMode &&
+            !_isLegacyAccount(doc.data()) &&
+            _auth.currentUser?.emailVerified != true) {
+          await _auth.signOut();
+          return {'success': false, 'message': 'email_not_verified', 'email': email};
         }
         final user = {...doc.data()!, 'student_id': uid};
         return {'success': true, 'role': 'student', 'user': user};
@@ -81,9 +141,11 @@ class ApiService {
         }
 
         // Admin / viewer accounts are provisioned by an administrator and skip
-        // the email-verification gate; regular staff must still verify.
+        // the email-verification gate; regular staff must still verify, unless
+        // the account predates the closing of demo mode (see kLegacyAccountCutoff).
         final sRole = (staffData['role'] ?? 'staff').toString();
         if (!kDemoMode && sRole != 'admin' && sRole != 'viewer' &&
+            !_isLegacyAccount(staffData) &&
             _auth.currentUser?.emailVerified != true) {
           await _auth.signOut();
           return {'success': false, 'message': 'email_not_verified', 'email': identifier};
@@ -100,20 +162,22 @@ class ApiService {
         msg = 'Too many attempts. Try again later.';
       return {'success': false, 'message': msg};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
   static Future<Map<String, dynamic>> registerStudent(
       Map<String, dynamic> data) async {
-    try {
-      final email    = data['email'] as String;
-      final password = data['password'] as String;
-      final name     = '${data['first_name']} ${data['last_name']}';
-      final studentNumber = data['student_number'] as String;
+    final email    = data['email'] as String;
+    final password = data['password'] as String;
+    final name     = '${data['first_name']} ${data['last_name']}';
+    final studentNumber = data['student_number'] as String;
+    final lookupRef = _db.collection('student_lookup').doc(studentNumber);
 
+    UserCredential? cred;
+    var lookupWritten = false;
+    try {
       // Step 1: Create Firebase Auth user first
-      UserCredential cred;
       try {
         cred = await _auth.createUserWithEmailAndPassword(
             email: email, password: password);
@@ -130,16 +194,21 @@ class ApiService {
       // Send verification email before Firestore write (skipped in demo mode)
       if (!kDemoMode) await cred.user!.sendEmailVerification();
 
-      // Step 2: Enforce student-number uniqueness via the public lookup index
-      // (a single-doc get, which is allowed by the security rules).
-      final lookupRef = _db.collection('student_lookup').doc(studentNumber);
+      // Step 2: Claim the student number. The security rules only allow
+      // CREATE on student_lookup (never update), so if the number is already
+      // taken this write is rejected by the server — a race-proof uniqueness
+      // check. (The old read-then-check could let two simultaneous
+      // registrations of the same number both pass.)
       try {
-        final existing = await lookupRef.get();
-        if (existing.exists) {
+        await lookupRef.set({'email': email, 'uid': uid});
+        lookupWritten = true;
+      } on FirebaseException catch (e) {
+        if (e.code == 'permission-denied') {
           await cred.user!.delete();
           return {'success': false, 'message': 'Student ID is already registered.'};
         }
-      } catch (_) {}
+        rethrow;
+      }
 
       // Step 3: Save student profile to Firestore
       await _db.collection('students').doc(uid).set({
@@ -153,11 +222,7 @@ class ApiService {
         'created_at':     FieldValue.serverTimestamp(),
       });
 
-      // Step 4: Write the public lookup (student_number → email + uid) so the
-      // student can later sign in using only their student number.
-      await lookupRef.set({'email': email, 'uid': uid});
-
-      // Step 5: Sign out after registration so they go back to login screen
+      // Step 4: Sign out after registration so they go back to login screen
       await _auth.signOut();
 
       return {
@@ -166,7 +231,12 @@ class ApiService {
         'student_id': uid,
       };
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      // Roll back so a half-finished registration doesn't orphan an Auth
+      // account or squat the student number (which would show "already
+      // registered" forever with no working profile behind it).
+      try { if (lookupWritten) await lookupRef.delete(); } catch (_) {}
+      try { await cred?.user?.delete(); } catch (_) {}
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
   static Future<Map<String, dynamic>> registerStaff(
@@ -201,7 +271,7 @@ class ApiService {
       return {'success': false, 'message': 'Email is already registered.'};
     return {'success': false, 'message': e.message ?? 'Registration failed.'};
   } catch (e) {
-    return {'success': false, 'message': e.toString()};
+    return {'success': false, 'message': _friendlyError(e)};
   }
 }
   static Future<Map<String, dynamic>> resendVerificationEmail(
@@ -219,7 +289,7 @@ class ApiService {
     } on FirebaseAuthException catch (e) {
       return {'success': false, 'message': e.message ?? 'Failed to resend verification email.'};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -237,7 +307,7 @@ class ApiService {
       }
       return {'success': false, 'message': e.message ?? 'Could not send reset email.'};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -259,6 +329,53 @@ class ApiService {
     if (category.isNotEmpty)
       items = items.where((e) => e['category'] == category).toList();
     return items;
+  }
+
+  // Cursor-paginated equipment, ordered by name. Firestore bills reads per
+  // document, so pulling a screenful at a time keeps the cost of opening the
+  // catalog flat no matter how large the inventory grows — getEquipment()
+  // above reads the entire collection every call.
+  //
+  // Only the ordering is done server-side: the catalog's filters are a
+  // multi-select category set, a case-insensitive substring search, and a
+  // course rule that matches items with no course set, none of which Firestore
+  // can express as a query. They stay on the client, over the loaded pages.
+  static Future<
+      ({
+        List<Map<String, dynamic>> items,
+        DocumentSnapshot? cursor,
+        bool hasMore,
+      })> getEquipmentPage({int limit = 20, DocumentSnapshot? startAfter}) async {
+    Query q = _db.collection('equipment').orderBy('equipment_name').limit(limit);
+    if (startAfter != null) q = q.startAfterDocument(startAfter);
+    final snap = await q.get();
+    final items = snap.docs
+        .map((d) => {...d.data() as Map<String, dynamic>, 'equipment_id': d.id})
+        .toList();
+    return (
+      items: items,
+      cursor: snap.docs.isEmpty ? null : snap.docs.last,
+      hasMore: snap.docs.length == limit,
+    );
+  }
+
+  static Future<Map<String, dynamic>?> getEquipmentById(String id) async {
+    if (id.isEmpty) return null;
+    final doc = await _db.collection('equipment').doc(id).get();
+    if (!doc.exists) return null;
+    return {...doc.data() as Map<String, dynamic>, 'equipment_id': doc.id};
+  }
+
+  // Inventory header counts via aggregation queries: the server returns only
+  // the number, billed per ~1000 documents scanned rather than per document
+  // read. This keeps the summary accurate over the whole inventory while the
+  // list below it is paginated.
+  static Future<({int total, int available})> getEquipmentCounts() async {
+    final col = _db.collection('equipment');
+    final totalSnap = await col.count().get();
+    final availSnap =
+        await col.where('status', isEqualTo: 'Available').count().get();
+    return (total: totalSnap.count ?? 0, available: availSnap.count ?? 0);
   }
 
   static Future<Map<String, dynamic>> getEquipmentByQr(String qrCode) async {
@@ -301,7 +418,8 @@ class ApiService {
         'brand':          data['brand'] ?? '',
         'model':          data['model'] ?? '',
         'serial_number':  data['serial_number'] ?? '',
-        'image_url':      data['image_url'] ?? '',
+        // Photos are written separately by saveEquipmentPhoto once the document
+        // exists and its id is known.
         'created_at':     FieldValue.serverTimestamp(),
       });
       return {
@@ -311,7 +429,7 @@ class ApiService {
         'qr_code':      qrCode,
       };
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -321,7 +439,7 @@ class ApiService {
       await _db.collection('equipment').doc(equipmentId).update(data);
       return {'success': true};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -344,30 +462,74 @@ class ApiService {
         };
       }
       await _db.collection('equipment').doc(equipmentId).delete();
-      // Best-effort cleanup of the stored image; ignore if missing.
+      // Best-effort cleanup of the full-size photo; ignore if there is none.
       try {
-        await FirebaseStorage.instance
-            .ref()
-            .child('equipment_images/$equipmentId.jpg')
-            .delete();
+        await _db.collection('equipment_photos').doc(equipmentId).delete();
       } catch (_) {}
       return {'success': true, 'message': 'Equipment deleted.'};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
-  static Future<String?> uploadEquipmentImage(
-      String equipmentId, Uint8List bytes) async {
+  // ── Equipment photos ──────────────────────────────────────────────────────
+  // Photos are kept in Firestore, not Cloud Storage: Storage requires the paid
+  // Blaze plan, and this project stays on the free Spark plan. Each photo is
+  // written twice —
+  //   • `photo_thumb` (~192px) on the equipment document itself, so every list
+  //     screen shows it with no extra read; a page of 20 costs roughly 160 KB;
+  //   • a ~800px copy in equipment_photos/{equipmentId}, read only when the
+  //     detail screen opens.
+  // Firestore caps a document at 1 MiB and both sizes land far below that.
+  static const int _thumbWidth = 192;
+  static const int _fullWidth  = 800;
+
+  // Runs on a background isolate via compute() — decoding a multi-megapixel
+  // camera photo would otherwise stutter the UI.
+  static ({Uint8List thumb, Uint8List full})? _encodePhoto(Uint8List raw) {
+    final decoded = img.decodeImage(raw);
+    if (decoded == null) return null;
+    final thumb = img.copyResize(decoded, width: _thumbWidth);
+    final full  = decoded.width > _fullWidth
+        ? img.copyResize(decoded, width: _fullWidth)
+        : decoded;
+    return (
+      thumb: Uint8List.fromList(img.encodeJpg(thumb, quality: 60)),
+      full:  Uint8List.fromList(img.encodeJpg(full, quality: 70)),
+    );
+  }
+
+  // Stores both sizes. Returns the thumbnail so the caller can show it at once,
+  // or a message explaining what went wrong — a silent failure here would
+  // leave equipment with no photo and give staff no hint of it.
+  static Future<({Uint8List? thumb, String? error})> saveEquipmentPhoto(
+      String equipmentId, Uint8List raw) async {
     try {
-      final ref = FirebaseStorage.instance
-          .ref()
-          .child('equipment_images/$equipmentId.jpg');
-      await ref.putData(bytes, SettableMetadata(contentType: 'image/jpeg'));
-      return await ref.getDownloadURL();
-    } catch (_) {
-      return null;
+      final encoded = await compute(_encodePhoto, raw);
+      if (encoded == null) {
+        return (thumb: null, error: 'That image could not be read.');
+      }
+      await _db.collection('equipment_photos').doc(equipmentId).set({
+        'image':      Blob(encoded.full),
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+      await _db
+          .collection('equipment')
+          .doc(equipmentId)
+          .update({'photo_thumb': Blob(encoded.thumb)});
+      return (thumb: encoded.thumb, error: null);
+    } catch (e) {
+      return (thumb: null, error: _friendlyError(e));
     }
+  }
+
+  // Full-size photo for the detail screen. Null when none was uploaded.
+  static Future<Uint8List?> getEquipmentPhoto(String equipmentId) async {
+    if (equipmentId.isEmpty) return null;
+    final doc = await _db.collection('equipment_photos').doc(equipmentId).get();
+    if (!doc.exists) return null;
+    final blob = doc.data()?['image'];
+    return blob is Blob ? blob.bytes : null;
   }
 
   // ── Borrow / Return ───────────────────────────────────────────────────────
@@ -437,20 +599,19 @@ class ApiService {
       // Honour the student's requested return time, enforcing the same-day
       // 5:00 PM laboratory policy as the latest possible deadline.
       final now = DateTime.now();
-      final reqDue = DateTime.tryParse('${data['due_date'] ?? ''}');
-      final DateTime dueDate;
-      if (reqDue != null &&
-          !(reqDue.hour > 17 || (reqDue.hour == 17 && reqDue.minute > 0))) {
-        dueDate = DateTime(now.year, now.month, now.day, reqDue.hour, reqDue.minute, 0);
-      } else {
-        dueDate = DateTime(now.year, now.month, now.day, 17, 0, 0);
-      }
+      final dueDate =
+          computeDueDate(now, DateTime.tryParse('${data['due_date'] ?? ''}'));
 
       final ref = await _db.collection('borrow_transactions').add({
         'student_id':     sid,
         'equipment_id':   equipId,
         'equipment_name': eqData['equipment_name'],
         'qr_code':        eqData['qr_code'],
+        // Thumbnail copied onto the transaction so the borrower's list shows
+        // the photo without a second read per row, and keeps showing the item
+        // as it looked when borrowed. ~8 KB.
+        if (eqData['photo_thumb'] != null) 'photo_thumb': eqData['photo_thumb'],
+        'category':       eqData['category'] ?? '',
         'borrower_name':  data['borrower_name'] ?? '',
         'student_number': data['student_number'] ?? '',
         'subject':        data['subject'] ?? '',
@@ -467,12 +628,26 @@ class ApiService {
         'transaction_id': ref.id,
       };
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
+  // Same-day 5:00 PM due-date policy: a requested time at or before 17:00 is
+  // honoured (on today's date); anything later — or no request — clamps to
+  // 17:00. Public and pure so the policy is unit-testable (see test/).
+  static DateTime computeDueDate(DateTime now, DateTime? requested) {
+    if (requested != null &&
+        !(requested.hour > 17 ||
+            (requested.hour == 17 && requested.minute > 0))) {
+      return DateTime(
+          now.year, now.month, now.day, requested.hour, requested.minute, 0);
+    }
+    return DateTime(now.year, now.month, now.day, 17, 0, 0);
+  }
+
   // Equipment status to set when an item is returned in a given condition.
-  static String _equipmentStatusForCondition(String condition) {
+  // Public and pure so the mapping is unit-testable (see test/).
+  static String equipmentStatusForCondition(String condition) {
     switch (condition) {
       case 'Damaged':
       case 'Under Repair':
@@ -504,13 +679,16 @@ class ApiService {
           'status':             'Returned',
           'return_date':        FieldValue.serverTimestamp(),
           'condition_returned': condition,
+          // Audit trail: which staff member processed this return.
+          'returned_by':        Session.staffId,
+          'returned_by_name':   Session.name,
         });
         tx.update(_db.collection('equipment').doc(equipId),
-            {'status': _equipmentStatusForCondition(condition)});
+            {'status': equipmentStatusForCondition(condition)});
         return {'success': true, 'message': 'Equipment returned successfully.'};
       });
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -535,6 +713,15 @@ class ApiService {
           'message': 'No active loan found for this equipment.'
         };
       }
+      if (active.length > 1) {
+        // Data inconsistency — one physical item should never have two
+        // Approved loans. Surface it instead of silently returning one.
+        return {
+          'success': false,
+          'message': 'Multiple active loans found for this equipment. '
+              'Please resolve them from the Requests screen.',
+        };
+      }
       final activeDoc = active.first;
       final result = await returnEquipment(activeDoc.id, condition);
       if (result['success'] == true) {
@@ -546,24 +733,17 @@ class ApiService {
       }
       return result;
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
   // ── Transactions ──────────────────────────────────────────────────────────
-  static Future<List<dynamic>> getMyBorrowings(
-      {dynamic studentId = 0, String studentNumber = ''}) async {
-    final sid = Session.currentUser?['student_id']?.toString() ?? '';
-    if (sid.isEmpty) return [];
-
-    // Query without orderBy to avoid composite index requirement
-    // Firestore only needs a single-field index for .where()
-    final snap = await _db
-        .collection('borrow_transactions')
-        .where('student_id', isEqualTo: sid)
-        .get();
-
-    final results = snap.docs.map((d) {
+  // Shared doc → map conversion for borrow transactions (timestamps to ISO
+  // strings, doc id in, newest first). Used by both the one-shot getters and
+  // the live streams below.
+  static List<dynamic> _mapTransactionDocs(
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+    final results = docs.map((d) {
       final data = d.data();
       return {
         ...data,
@@ -579,47 +759,132 @@ class ApiService {
       };
     }).toList();
 
-    // Sort by borrow_date descending in Dart — no index needed
+    // Sort by borrow_date descending in Dart — no composite index needed
     results.sort((a, b) {
       final aDate = DateTime.tryParse('${a['borrow_date']}') ?? DateTime(2000);
       final bDate = DateTime.tryParse('${b['borrow_date']}') ?? DateTime(2000);
       return bDate.compareTo(aDate);
     });
-
     return results;
   }
 
+  static Future<List<dynamic>> getMyBorrowings(
+      {dynamic studentId = 0, String studentNumber = ''}) async {
+    final sid = Session.currentUser?['student_id']?.toString() ?? '';
+    if (sid.isEmpty) return [];
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('student_id', isEqualTo: sid)
+        .get();
+    return _mapTransactionDocs(snap.docs);
+  }
+
   static Future<List<dynamic>> getRequests({String status = ''}) async {
-    // Query without orderBy to avoid composite index requirement
-    Query q = _db.collection('borrow_transactions');
+    Query<Map<String, dynamic>> q = _db.collection('borrow_transactions');
     if (status.isNotEmpty && status != 'All') {
       q = q.where('status', isEqualTo: status);
     }
     final snap = await q.get();
-    final results = snap.docs.map((d) {
-      final data = d.data() as Map<String, dynamic>;
-      return {
-        ...data,
-        'transaction_id': d.id,
-        'due_date': (data['due_date'] as Timestamp?)
-                ?.toDate()
-                .toIso8601String() ??
-            '',
-        'borrow_date': (data['borrow_date'] as Timestamp?)
-                ?.toDate()
-                .toIso8601String() ??
-            '',
-      };
-    }).toList();
-
-    // Sort descending by borrow_date in Dart
-    results.sort((a, b) {
-      final aDate = DateTime.tryParse('${a['borrow_date']}') ?? DateTime(2000);
-      final bDate = DateTime.tryParse('${b['borrow_date']}') ?? DateTime(2000);
-      return bDate.compareTo(aDate);
-    });
-    return results;
+    return _mapTransactionDocs(snap.docs);
   }
+
+  // Staff dashboard summary.
+  //
+  // Anything that is only ever shown as a number is counted server-side with an
+  // aggregation query, which is billed per ~1000 documents scanned rather than
+  // per document read. Only the pending and approved transactions are fetched
+  // as documents, because the dashboard lists them — and both are naturally
+  // small (items currently requested or out on loan), unlike the collections
+  // they used to be filtered out of. This screen previously read the whole of
+  // equipment, borrow_transactions, damage_reports and students on every open
+  // and after every approve/reject.
+  static Future<
+      ({
+        Map<String, dynamic> stats,
+        List<dynamic> pending,
+        List<dynamic> approved,
+      })> getDashboardData() async {
+    // All issued before any is awaited, so they run concurrently.
+    final equipF    = getEquipmentCounts();
+    final pendingF  = getRequests(status: 'Pending');
+    final approvedF = getRequests(status: 'Approved');
+    final damageF   = _db
+        .collection('damage_reports')
+        .where('status', isEqualTo: 'Open')
+        .count()
+        .get();
+    final studentsF = _db.collection('students').count().get();
+    final heldF     = _db
+        .collection('students')
+        .where('hold', isEqualTo: true)
+        .count()
+        .get();
+
+    final equip    = await equipF;
+    final pending  = await pendingF;
+    final approved = await approvedF;
+    final damage   = await damageF;
+    final students = await studentsF;
+    final held     = await heldF;
+
+    final now = DateTime.now();
+    final overdue = approved.where((e) {
+      final due = DateTime.tryParse('${e['due_date']}'.replaceAll(' ', 'T'));
+      return due != null && due.isBefore(now);
+    }).length;
+
+    return (
+      stats: {
+        'pending_requests':    pending.length,
+        'active_loans':        approved.length,
+        'overdue_loans':       overdue,
+        'total_equipment':     equip.total,
+        'available_equipment': equip.available,
+        'damage_reports':      damage.count ?? 0,
+        'total_students':      students.count ?? 0,
+        'held_students':       held.count ?? 0,
+      },
+      pending: pending,
+      approved: approved,
+    );
+  }
+
+  // Transactions from a cutoff date onward. borrow_transactions is the one
+  // collection that grows without bound — equipment and students plateau, but
+  // every borrow adds a row forever — so the reports screen scopes itself to a
+  // period instead of reading the entire history on every open. The inequality
+  // is on a single field, so Firestore's automatic index covers it.
+  static Future<List<dynamic>> getRequestsSince(DateTime cutoff) async {
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('borrow_date', isGreaterThanOrEqualTo: Timestamp.fromDate(cutoff))
+        .get();
+    return _mapTransactionDocs(snap.docs);
+  }
+
+  static Future<int> damageReportCount() async {
+    final snap = await _db.collection('damage_reports').count().get();
+    return snap.count ?? 0;
+  }
+
+  // ── Live streams (real-time UI) ───────────────────────────────────────────
+  // Firestore pushes changes as they happen, so screens built on these update
+  // by themselves — a student sees an approval the moment staff taps it, with
+  // no pull-to-refresh.
+  static Stream<List<dynamic>> myBorrowingsStream() {
+    final sid = Session.currentUser?['student_id']?.toString() ?? '';
+    if (sid.isEmpty) return Stream.value(const []);
+    return _db
+        .collection('borrow_transactions')
+        .where('student_id', isEqualTo: sid)
+        .snapshots()
+        .map((snap) => _mapTransactionDocs(snap.docs));
+  }
+
+  static Stream<List<dynamic>> requestsStream() => _db
+      .collection('borrow_transactions')
+      .snapshots()
+      .map((snap) => _mapTransactionDocs(snap.docs));
 
   // Approve or reject a borrow request. Runs in a transaction so that, on
   // approval, the equipment is only locked to Borrowed if it is still Available
@@ -649,19 +914,28 @@ class ApiService {
                   'Equipment is no longer available (${eqStatus ?? 'missing'}).'
             };
           }
-          tx.update(txRef, {'status': 'Approved'});
+          tx.update(txRef, {
+            'status': 'Approved',
+            // Audit trail: which staff member approved this request.
+            'approved_by': Session.staffId,
+            'approved_by_name': Session.name,
+            'approved_at': FieldValue.serverTimestamp(),
+          });
           tx.update(eqRef, {'status': 'Borrowed'});
           return {'success': true, 'message': 'Request approved.'};
         } else {
           tx.update(txRef, {
             'status': 'Rejected',
+            'rejected_by': Session.staffId,
+            'rejected_by_name': Session.name,
+            'rejected_at': FieldValue.serverTimestamp(),
             if (reason.trim().isNotEmpty) 'reject_reason': reason.trim(),
           });
           return {'success': true, 'message': 'Request rejected.'};
         }
       });
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -680,7 +954,7 @@ class ApiService {
         'report_id': ref.id,
       };
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -711,11 +985,14 @@ class ApiService {
   }
 
   // Number of damage reports still needing attention (status == Open).
+  // Counted server-side rather than by reading every damage report.
   static Future<int> openDamageReportCount() async {
-    final snap = await _db.collection('damage_reports').get();
-    return snap.docs
-        .where((d) => (d.data()['status'] ?? 'Open') == 'Open')
-        .length;
+    final snap = await _db
+        .collection('damage_reports')
+        .where('status', isEqualTo: 'Open')
+        .count()
+        .get();
+    return snap.count ?? 0;
   }
 
   // Update a damage report's triage status (Open → Reviewed / Resolved) and
@@ -733,7 +1010,7 @@ class ApiService {
       }
       return {'success': true};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -750,7 +1027,7 @@ class ApiService {
       });
       return {'success': true};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 
@@ -770,6 +1047,87 @@ class ApiService {
     return {...doc.data()!, 'student_id': doc.id};
   }
 
+  // All students (staff directory), sorted by name and optionally filtered by
+  // name or student number. Firestore has no substring search, so we fetch and
+  // filter in Dart — fine at a lab's scale. Staff-only: the security rules only
+  // let a signed-in staff member read the students collection.
+  static Future<List<dynamic>> getStudents({String search = ''}) async {
+    final snap = await _db.collection('students').get();
+    var items =
+        snap.docs.map((d) => {...d.data(), 'student_id': d.id}).toList();
+    items.sort((a, b) => '${a['name'] ?? ''}'
+        .toLowerCase()
+        .compareTo('${b['name'] ?? ''}'.toLowerCase()));
+    final q = search.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      items = items.where((s) {
+        final name = '${s['name'] ?? ''}'.toLowerCase();
+        final number = '${s['student_number'] ?? ''}'.toLowerCase();
+        return name.contains(q) || number.contains(q);
+      }).toList();
+    }
+    return items;
+  }
+
+  // A single student's borrow transactions (newest first) for the staff
+  // student-detail view. Reuses the shared transaction mapper.
+  static Future<List<dynamic>> getStudentTransactions(String studentId) async {
+    if (studentId.isEmpty) return [];
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('student_id', isEqualTo: studentId)
+        .get();
+    return _mapTransactionDocs(snap.docs);
+  }
+
+  // Parse a transaction date field that may be an ISO string (borrow/due, as
+  // mapped) or a raw Firestore Timestamp (return_date isn't pre-converted).
+  static DateTime? _asDate(dynamic v) {
+    if (v == null) return null;
+    if (v is Timestamp) return v.toDate();
+    return DateTime.tryParse('$v'.replaceAll(' ', 'T'));
+  }
+
+  // Summarises a student's borrowing behaviour into counts + a rating, so staff
+  // can decide at a glance whether to trust or hold them. Pure (takes an
+  // optional [now] for testability). Counts:
+  //   • loans   — approved or returned transactions (actual lends)
+  //   • late    — returned after the due date
+  //   • overdue — still out and past due right now
+  //   • damages — returned in a damaged / repair / disposal condition
+  // Rating: Good (no issues) → Fair (1–2) → Watch (3+).
+  static Map<String, dynamic> studentReliability(List<dynamic> txns,
+      {DateTime? now}) {
+    final ref = now ?? DateTime.now();
+    var loans = 0, late = 0, overdue = 0, damages = 0;
+    for (final t in txns) {
+      final status = '${t['status'] ?? ''}';
+      final due = _asDate(t['due_date']);
+      if (status == 'Approved' || status == 'Returned') loans++;
+      if (status == 'Returned') {
+        final ret = _asDate(t['return_date']);
+        if (due != null && ret != null && ret.isAfter(due)) late++;
+        final cond = '${t['condition_returned'] ?? ''}';
+        if (cond == 'Damaged' ||
+            cond == 'Under Repair' ||
+            cond == 'For Disposal') {
+          damages++;
+        }
+      } else if (status == 'Approved') {
+        if (due != null && due.isBefore(ref)) overdue++;
+      }
+    }
+    final flags = late + overdue + damages;
+    final rating = flags == 0 ? 'Good' : (flags <= 2 ? 'Fair' : 'Watch');
+    return {
+      'loans': loans,
+      'late': late,
+      'overdue': overdue,
+      'damages': damages,
+      'rating': rating,
+    };
+  }
+
   // ── Update Profile ────────────────────────────────────────────────────────
   static Future<Map<String, dynamic>> updateProfile({
     required dynamic studentId,
@@ -785,7 +1143,7 @@ class ApiService {
       });
       return {'success': true, 'message': 'Profile updated successfully.'};
     } catch (e) {
-      return {'success': false, 'message': e.toString()};
+      return {'success': false, 'message': _friendlyError(e)};
     }
   }
 }
@@ -855,6 +1213,9 @@ class Session {
   static bool get isAdmin  => role == 'staff' && staffRole == 'admin';
   // Whether the current user may perform write actions in the staff portal.
   static bool get canManage => role == 'staff' && staffRole != 'viewer';
+  // The signed-in staff member's document id — stamped onto transactions they
+  // approve/reject/return so there's an audit trail of who did what.
+  static String get staffId => (currentUser?['staff_id'] ?? '').toString();
 
   // ── Borrowing hold / penalty (students) ────────────────────────────────────
   static bool get isOnHold => currentUser?['hold'] == true;
@@ -862,17 +1223,41 @@ class Session {
       (currentUser?['hold_reason'] ?? '').toString();
 }
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
-  runApp(const LabBorrowApp());
+// ─── Notification preferences ────────────────────────────────────────────────
+// Persisted in shared_preferences and honoured by the student dashboard's
+// notification cards (previously the settings toggles were cosmetic — they
+// were never saved and nothing read them).
+class NotifPrefs {
+  static bool approved        = true;
+  static bool rejected        = true;
+  static bool dueSoon         = true;
+  static bool overdue         = true;
+  static bool returnConfirmed = true;
+  static bool damageUpdate    = false;
+
+  static Future<void> load() async {
+    final p = await SharedPreferences.getInstance();
+    approved        = p.getBool('notif_approved')  ?? true;
+    rejected        = p.getBool('notif_rejected')  ?? true;
+    dueSoon         = p.getBool('notif_due_soon')  ?? true;
+    overdue         = p.getBool('notif_overdue')   ?? true;
+    returnConfirmed = p.getBool('notif_return')    ?? true;
+    damageUpdate    = p.getBool('notif_damage')    ?? false;
+  }
+
+  static Future<void> save() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool('notif_approved', approved);
+    await p.setBool('notif_rejected', rejected);
+    await p.setBool('notif_due_soon', dueSoon);
+    await p.setBool('notif_overdue', overdue);
+    await p.setBool('notif_return', returnConfirmed);
+    await p.setBool('notif_damage', damageUpdate);
+  }
 }
 
-
-
 // ─── App Entry ───────────────────────────────────────────────────────────────
+// (The real main() lives in lib/main.dart — this library only exports the app.)
 
 class LabBorrowApp extends StatelessWidget {
   const LabBorrowApp({super.key});
@@ -1099,6 +1484,73 @@ class StatusBadge extends StatelessWidget {
           fontWeight: FontWeight.bold,
           letterSpacing: 0.4,
         ),
+      ),
+    );
+  }
+}
+
+IconData equipmentIcon(String category) {
+  switch (category.toLowerCase()) {
+    case 'electronics':     return Icons.electric_bolt_rounded;
+    case 'tools':           return Icons.build_rounded;
+    case 'measurement':     return Icons.straighten_rounded;
+    case 'optics':          return Icons.remove_red_eye_rounded;
+    case 'microcontroller': return Icons.memory_rounded;
+    default:                return Icons.science_outlined;
+  }
+}
+
+// Pulls the stored thumbnail out of an equipment (or transaction) record.
+// Firestore hands back a Blob; anything else means no photo. Takes dynamic so
+// call sites reading from List<dynamic> need no casts.
+Uint8List? photoThumbOf(dynamic record) {
+  if (record is! Map) return null;
+  final v = record['photo_thumb'];
+  return v is Blob ? v.bytes : null;
+}
+
+// Equipment photo thumbnail. Students rely on the photo to confirm they are
+// requesting — and being handed — the right item, so every list that names a
+// piece of equipment should show it. Falls back to a category icon when no
+// photo was uploaded or the bytes cannot be decoded.
+class EquipmentThumb extends StatelessWidget {
+  final Uint8List? bytes;
+  final String category;
+  final Color color;
+  final double size;
+  const EquipmentThumb({
+    super.key,
+    required this.bytes,
+    required this.category,
+    required this.color,
+    this.size = 48,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final radius = size / 4;
+    final fallback = Container(
+      width: size, height: size,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(radius),
+      ),
+      child: Icon(equipmentIcon(category), color: color, size: size / 2),
+    );
+    final data = bytes;
+    if (data == null || data.isEmpty) return fallback;
+    // Decode straight to the display size rather than the stored 192px: a list
+    // of these otherwise holds full-resolution bitmaps in memory.
+    final cachePx =
+        (size * MediaQuery.devicePixelRatioOf(context)).round();
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: Image.memory(
+        data,
+        width: size, height: size, fit: BoxFit.cover,
+        cacheWidth: cachePx,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => fallback,
       ),
     );
   }
@@ -1435,6 +1887,7 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
       if (res['success'] == true) {
         await _saveRemembered(id);
+        if (!mounted) return;
         Session.set(res['user'] as Map<String, dynamic>, res['role'] as String);
         Navigator.pushReplacement(context, MaterialPageRoute(
           builder: (_) => _isStudent ? const StudentHomeScreen() : const AdminDashboardScreen()));
@@ -1445,15 +1898,8 @@ class _LoginScreenState extends State<LoginScreen> {
           SnackBar(content: Text(res['message'] ?? 'Login failed.'), backgroundColor: AppTheme.danger));
       }
     } catch (e) {
-      final msg = e.toString();
-      String userMsg;
-      if (msg.contains('network') || msg.contains('Network') || msg.contains('unavailable')) {
-        userMsg = 'No internet connection. Please check your Wi-Fi or mobile data.';
-      } else if (msg.contains('timeout') || msg.contains('Timeout')) {
-        userMsg = 'Connection timed out. Please try again.';
-      } else {
-        userMsg = 'Error: $msg';
-      }
+      // Never surface a raw exception to the user.
+      final userMsg = ApiService._friendlyError(e);
       if (mounted) {
         showDialog(
           context: context,
@@ -1656,7 +2102,12 @@ class _LoginScreenState extends State<LoginScreen> {
                         controller: _passwordCtrl,
                         obscureText: _obscure,
                         decoration: InputDecoration(
-                          hintText: '••••••••',
+                          // NOT a row of bullets: "remember me" restores the
+                          // identifier but never the password, so a bullet hint
+                          // over an empty field is indistinguishable from a
+                          // filled obscured one — users tapped Sign In and got
+                          // "Please fill in all fields" on a form that looked complete.
+                          hintText: 'Enter your password',
                           prefixIcon: const Icon(Icons.lock_outline_rounded,
                               color: AppTheme.textMid),
                           suffixIcon: GestureDetector(
@@ -2389,7 +2840,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                           validator: _validateStudentId,
                           onChanged: (_) => setState(() {}),
                           decoration: InputDecoration(
-                            hintText: '26-12345-123',
+                            hintText: 'e.g. 26-12345-123',
                             prefixIcon: const Icon(Icons.badge_outlined,
                                 color: AppTheme.textMid),
                             suffixIcon: _studentIdCtrl.text.isNotEmpty
@@ -2487,7 +2938,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                                     controller: _firstNameCtrl,
                                     validator: _validateRequired,
                                     decoration: const InputDecoration(
-                                        hintText: 'Juan'),
+                                        hintText: 'e.g. Juan'),
                                   ),
                                 ],
                               ),
@@ -2503,7 +2954,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                                     controller: _lastNameCtrl,
                                     validator: _validateRequired,
                                     decoration: const InputDecoration(
-                                        hintText: 'Dela Cruz'),
+                                        hintText: 'e.g. Dela Cruz'),
                                   ),
                                 ],
                               ),
@@ -2901,6 +3352,8 @@ class _StudentDashboardState extends State<_StudentDashboard> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
+      // Honour the user's saved notification toggles when building cards.
+      await NotifPrefs.load();
       final loans = await ApiService.getMyBorrowings(
         studentId: Session.studentId,
         studentNumber: Session.studentNumber,
@@ -2949,15 +3402,18 @@ class _StudentDashboardState extends State<_StudentDashboard> {
       final due      = DateTime.tryParse('${loan['due_date']}'.replaceAll(' ', 'T'));
       final now      = DateTime.now();
 
+      // Each card type honours the corresponding toggle in
+      // Profile → Notifications (NotifPrefs).
       if (status == 'Approved' && due != null) {
-        if (due.year == now.year && due.month == now.month && due.day == now.day) {
+        if (NotifPrefs.dueSoon &&
+            due.year == now.year && due.month == now.month && due.day == now.day) {
           notes.add({
             'icon':  Icons.access_alarm_rounded,
             'color': AppTheme.warning,
             'title': 'Due Today',
             'body':  '$equipName is due back today before 5:00 PM.',
           });
-        } else if (due.isBefore(now)) {
+        } else if (NotifPrefs.overdue && due.isBefore(now)) {
           notes.add({
             'icon':  Icons.warning_amber_rounded,
             'color': AppTheme.danger,
@@ -2966,7 +3422,8 @@ class _StudentDashboardState extends State<_StudentDashboard> {
           });
         }
       }
-      if (status == 'Approved' && due != null && !due.isBefore(now)) {
+      if (NotifPrefs.approved &&
+          status == 'Approved' && due != null && !due.isBefore(now)) {
         notes.add({
           'icon':  Icons.check_circle_rounded,
           'color': AppTheme.success,
@@ -2974,12 +3431,20 @@ class _StudentDashboardState extends State<_StudentDashboard> {
           'body':  'Your request for $equipName has been approved.',
         });
       }
-      if (status == 'Rejected') {
+      if (NotifPrefs.rejected && status == 'Rejected') {
         notes.add({
           'icon':  Icons.cancel_rounded,
           'color': AppTheme.danger,
           'title': 'Request Rejected',
           'body':  'Your request for $equipName was rejected by staff.',
+        });
+      }
+      if (NotifPrefs.returnConfirmed && status == 'Returned') {
+        notes.add({
+          'icon':  Icons.assignment_turned_in_rounded,
+          'color': AppTheme.success,
+          'title': 'Return Confirmed',
+          'body':  'Your return of $equipName has been confirmed by staff.',
         });
       }
     }
@@ -3617,43 +4082,76 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
   bool _hasError = false;
   List<dynamic> _items = [];
 
+  // Pagination — the catalog loads a screenful at a time rather than the whole
+  // equipment collection (see ApiService.getEquipmentPage).
+  static const int _pageSize = 20;
+  final _scrollController = ScrollController();
+  DocumentSnapshot? _cursor;
+  bool _hasMore = true;
+  bool _loadingMore = false;
+
   @override
   void initState() {
     super.initState();
+    _scrollController.addListener(_onScroll);
     _loadEquipment();
   }
 
+  @override
+  void dispose() {
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    final pos = _scrollController.position;
+    if (pos.pixels >= pos.maxScrollExtent - 400) _loadMore();
+  }
+
+  // First page / pull-to-refresh — resets the cursor.
   Future<void> _loadEquipment() async {
-    setState(() { _loading = true; _hasError = false; });
+    setState(() {
+      _loading = true;
+      _hasError = false;
+      _items = [];
+      _cursor = null;
+      _hasMore = true;
+    });
     try {
-      final data = await ApiService.getEquipment();
-      setState(() { _items = data; _loading = false; });
+      final page = await ApiService.getEquipmentPage(limit: _pageSize);
+      if (!mounted) return;
+      setState(() {
+        _items = page.items;
+        _cursor = page.cursor;
+        _hasMore = page.hasMore;
+        _loading = false;
+      });
     } catch (e) {
+      if (!mounted) return;
       setState(() { _loading = false; _hasError = true; });
     }
   }
 
-  IconData _equipmentIcon(String category) {
-    switch (category.toLowerCase()) {
-      case 'electronics':     return Icons.electric_bolt_rounded;
-      case 'tools':           return Icons.build_rounded;
-      case 'measurement':     return Icons.straighten_rounded;
-      case 'optics':          return Icons.remove_red_eye_rounded;
-      case 'microcontroller': return Icons.memory_rounded;
-      default:                return Icons.science_outlined;
+  Future<void> _loadMore() async {
+    if (_loadingMore || !_hasMore || _loading) return;
+    setState(() => _loadingMore = true);
+    try {
+      final page = await ApiService.getEquipmentPage(
+          limit: _pageSize, startAfter: _cursor);
+      if (!mounted) return;
+      setState(() {
+        _items = [..._items, ...page.items];
+        _cursor = page.cursor ?? _cursor;
+        _hasMore = page.hasMore;
+        _loadingMore = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      // Keep what is already loaded; the next scroll retries.
+      setState(() => _loadingMore = false);
     }
-  }
-
-  Widget _catalogIconBox(String category, bool isAvailable) {
-    final color = isAvailable ? AppTheme.success : AppTheme.danger;
-    return Container(
-      width: 50, height: 50,
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.10),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Icon(_equipmentIcon(category), color: color, size: 24),
-    );
   }
 
   String get _filterLabel {
@@ -3671,6 +4169,41 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
 
   void _clearFilters() => setState(() => _selectedCategories.clear());
 
+  // Trailing row of the catalog list: paging spinner, an empty-result message,
+  // or a quiet end-of-list marker.
+  Widget _listFooter(bool isEmpty) {
+    if (_loadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 20),
+        child: Center(
+          child: SizedBox(
+              width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)),
+        ),
+      );
+    }
+    if (isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 40),
+        child: Column(children: [
+          Icon(Icons.search_off_rounded, size: 44, color: AppTheme.textLight),
+          SizedBox(height: 10),
+          Text('No equipment matches your filters',
+              style: TextStyle(color: AppTheme.textMid)),
+        ]),
+      );
+    }
+    if (!_hasMore) {
+      return const Padding(
+        padding: EdgeInsets.only(top: 16, bottom: 4),
+        child: Center(
+          child: Text('End of catalog',
+              style: TextStyle(fontSize: 11, color: AppTheme.textLight)),
+        ),
+      );
+    }
+    return const SizedBox(height: 4);
+  }
+
   @override
   Widget build(BuildContext context) {
     final studentCourse = Session.course;
@@ -3686,6 +4219,14 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
           itemCourses.contains(studentCourse);
       return matchCat && matchSearch && matchCourse;
     }).toList();
+
+    // Filters run over the pages loaded so far, so an active search or category
+    // can leave the screen looking empty while matches sit further down the
+    // collection. Pull the next page until there is enough to fill the list or
+    // the collection runs out.
+    if (filtered.length < _pageSize && _hasMore && !_loadingMore && !_loading) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    }
 
     return Scaffold(
       appBar: AppBar(title: const Text('Equipment Catalog')),
@@ -4033,11 +4574,14 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
             ),
           Expanded(
             child: ListView.separated(
+              controller: _scrollController,
               padding: const EdgeInsets.all(16),
               cacheExtent: 500,
-              itemCount: filtered.length,
+              // One extra row for the paging footer.
+              itemCount: filtered.length + 1,
               separatorBuilder: (_, _) => const SizedBox(height: 10),
               itemBuilder: (_, i) {
+                if (i == filtered.length) return _listFooter(filtered.isEmpty);
                 final e = filtered[i];
                 final isAvailable = (e['status'] ?? 'Available') == 'Available';
                 final category = e['category'] as String? ?? '';
@@ -4060,21 +4604,11 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
                     ),
                     child: Row(
                       children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(14),
-                          child: (e['image_url'] as String? ?? '').isNotEmpty
-                              ? Image.network(
-                                  e['image_url'] as String,
-                                  width: 50, height: 50,
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (context, error, stack) =>
-                                      _catalogIconBox(category, isAvailable),
-                                  loadingBuilder: (_, child, progress) =>
-                                      progress == null
-                                          ? child
-                                          : _catalogIconBox(category, isAvailable),
-                                )
-                              : _catalogIconBox(category, isAvailable),
+                        EquipmentThumb(
+                          bytes: photoThumbOf(e),
+                          category: category,
+                          color: isAvailable ? AppTheme.success : AppTheme.danger,
+                          size: 50,
                         ),
                         const SizedBox(width: 14),
                         Expanded(
@@ -4148,9 +4682,32 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
 
 // ─── Equipment Detail Screen ───────────────────────────────────────────────────
 
-class EquipmentDetailScreen extends StatelessWidget {
+class EquipmentDetailScreen extends StatefulWidget {
   final Map<String, dynamic> equipment;
   const EquipmentDetailScreen({super.key, required this.equipment});
+  @override
+  State<EquipmentDetailScreen> createState() => _EquipmentDetailScreenState();
+}
+
+class _EquipmentDetailScreenState extends State<EquipmentDetailScreen> {
+  Map<String, dynamic> get equipment => widget.equipment;
+
+  // The list thumbnail is already on the record; the larger copy lives in its
+  // own document and is fetched only here, when someone actually looks at it.
+  Uint8List? _fullPhoto;
+
+  @override
+  void initState() {
+    super.initState();
+    _fullPhoto = photoThumbOf(widget.equipment);
+    final id = '${widget.equipment['equipment_id'] ?? ''}';
+    if (id.isNotEmpty) {
+      ApiService.getEquipmentPhoto(id).then((bytes) {
+        if (!mounted || bytes == null) return;
+        setState(() => _fullPhoto = bytes);
+      }).catchError((_) {});
+    }
+  }
 
   IconData _categoryIcon(String cat) {
     switch (cat.toLowerCase()) {
@@ -4174,7 +4731,8 @@ class EquipmentDetailScreen extends StatelessWidget {
     final model     = equipment['model']          as String? ?? '';
     final serial    = equipment['serial_number']  as String? ?? '';
     final desc      = equipment['description']    as String? ?? '';
-    final imageUrl  = equipment['image_url']      as String? ?? '';
+    final photo     = _fullPhoto;
+    final hasPhoto  = photo != null && photo.isNotEmpty;
     final courses   = (equipment['courses'] as List?)?.cast<String>() ?? [];
     final equipId   = '${equipment['equipment_id'] ?? ''}';
     final isAvail   = status == 'Available';
@@ -4186,33 +4744,21 @@ class EquipmentDetailScreen extends StatelessWidget {
         slivers: [
           // ── App bar with collapsing image ──
           SliverAppBar(
-            expandedHeight: imageUrl.isNotEmpty ? 260 : 160,
+            expandedHeight: hasPhoto ? 260 : 160,
             pinned: true,
             backgroundColor: AppTheme.primary,
             iconTheme: const IconThemeData(color: Colors.white),
             flexibleSpace: FlexibleSpaceBar(
-              background: imageUrl.isNotEmpty
+              background: hasPhoto
                   ? Stack(fit: StackFit.expand, children: [
-                      Image.network(
-                        imageUrl,
+                      // Starts as the thumbnail already in hand, then swaps to
+                      // the full-size copy once it arrives.
+                      Image.memory(
+                        photo,
                         fit: BoxFit.cover,
+                        gaplessPlayback: true,
                         errorBuilder: (context, error, stack) =>
                             _imageFallback(category),
-                        loadingBuilder: (_, child, progress) {
-                          if (progress == null) return child;
-                          return Container(
-                            color: AppTheme.primary,
-                            child: Center(
-                              child: CircularProgressIndicator(
-                                value: progress.expectedTotalBytes != null
-                                    ? progress.cumulativeBytesLoaded /
-                                        progress.expectedTotalBytes!
-                                    : null,
-                                color: Colors.white,
-                              ),
-                            ),
-                          );
-                        },
                       ),
                       // Dark gradient so text is readable
                       const DecoratedBox(
@@ -4355,7 +4901,8 @@ class EquipmentDetailScreen extends StatelessWidget {
                                 MaterialPageRoute(
                                     builder: (_) => BorrowRequestScreen(
                                         equipmentName: name,
-                                        equipmentId: equipId)))
+                                        equipmentId: equipId,
+                                        equipment: equipment)))
                             : null,
                         icon: Icon(isAvail
                             ? Icons.assignment_outlined
@@ -4420,12 +4967,223 @@ Widget _specRow(String label, String value,
   );
 }
 
+// ─── Equipment Picker Sheet ───────────────────────────────────────────────────
+// Bottom sheet behind the borrow form's equipment field. Pages through the
+// collection (see ApiService.getEquipmentPage) rather than reading all of it,
+// and pops with the chosen record.
+
+class _EquipmentPickerSheet extends StatefulWidget {
+  final String selectedId;
+  const _EquipmentPickerSheet({required this.selectedId});
+  @override
+  State<_EquipmentPickerSheet> createState() => _EquipmentPickerSheetState();
+}
+
+class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
+  static const int _pageSize = 20;
+  final _scrollController = ScrollController();
+  final List<Map<String, dynamic>> _items = [];
+  DocumentSnapshot? _cursor;
+  bool _loading     = true;
+  bool _loadingMore = false;
+  bool _hasMore     = true;
+  bool _failed      = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_onScroll);
+    _loadMore();
+  }
+
+  @override
+  void dispose() {
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    final pos = _scrollController.position;
+    if (pos.pixels >= pos.maxScrollExtent - 300) _loadMore();
+  }
+
+  // Only 'Available' equipment is offered. That filter runs on the client,
+  // because combining it with the name ordering server-side would need a
+  // composite index (see the TODO in _AdminInventoryScreenState), so a page
+  // can arrive with nothing to show — build() keeps pulling until it does.
+  Future<void> _loadMore() async {
+    if (_loadingMore || !_hasMore) return;
+    _loadingMore = true;
+    try {
+      final page = await ApiService.getEquipmentPage(
+          limit: _pageSize, startAfter: _cursor);
+      if (!mounted) return;
+      setState(() {
+        _items.addAll(page.items.where((e) => e['status'] == 'Available'));
+        _cursor      = page.cursor ?? _cursor;
+        _hasMore     = page.hasMore;
+        _loading     = false;
+        _loadingMore = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _failed      = _items.isEmpty;
+        _hasMore     = false;
+        _loading     = false;
+        _loadingMore = false;
+      });
+    }
+  }
+
+  Widget _footer() {
+    if (_loadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: SizedBox(
+              width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+        ),
+      );
+    }
+    if (_items.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.only(top: 40),
+        child: Center(
+          child: Text('No available equipment.',
+              style: TextStyle(color: AppTheme.textMid)),
+        ),
+      );
+    }
+    return const SizedBox(height: 4);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Every item loaded so far was filtered out — pull the next page.
+    if (!_loading && !_loadingMore && _hasMore && _items.length < _pageSize) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    }
+
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.75,
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(children: [
+        // Handle
+        Container(
+          margin: const EdgeInsets.only(top: 12),
+          width: 40, height: 4,
+          decoration: BoxDecoration(
+              color: AppTheme.divider,
+              borderRadius: BorderRadius.circular(2)),
+        ),
+        const SizedBox(height: 12),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 20),
+          child: Row(children: [
+            Icon(Icons.science_outlined, color: AppTheme.primary, size: 20),
+            SizedBox(width: 10),
+            Text('Select Equipment',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold,
+                    color: AppTheme.textDark)),
+          ]),
+        ),
+        const SizedBox(height: 4),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 20),
+          child: Text('Only available equipment is shown.',
+              style: TextStyle(fontSize: 12, color: AppTheme.textMid)),
+        ),
+        const SizedBox(height: 12),
+        const Divider(color: AppTheme.divider, height: 1),
+        Expanded(
+          child: _loading
+              ? const Center(child: CircularProgressIndicator())
+              : _failed
+                  ? const Center(
+                      child: Text('Could not load equipment.',
+                          style: TextStyle(color: AppTheme.textMid)))
+                  : ListView.separated(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.all(16),
+                      // One extra row for the paging footer.
+                      itemCount: _items.length + 1,
+                      separatorBuilder: (_, _) => const SizedBox(height: 8),
+                      itemBuilder: (_, i) {
+                        if (i == _items.length) return _footer();
+                        final e = _items[i];
+                        final isSelected =
+                            widget.selectedId == '${e['equipment_id']}';
+                        return GestureDetector(
+                          onTap: () => Navigator.pop(context, e),
+                          child: Container(
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: isSelected
+                                  ? const Color(0x121B3A8C)
+                                  : Colors.white,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                  color: isSelected
+                                      ? AppTheme.primary
+                                      : AppTheme.divider),
+                            ),
+                            child: Row(children: [
+                              EquipmentThumb(
+                                bytes: photoThumbOf(e),
+                                category: e['category'] as String? ?? '',
+                                color: AppTheme.success,
+                                size: 40,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                Text(e['equipment_name'] as String,
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                        color: AppTheme.textDark)),
+                                Text('${e['qr_code']}  •  ${e['category']}',
+                                    style: const TextStyle(
+                                        fontSize: 12, color: AppTheme.textMid)),
+                              ])),
+                              StatusBadge(label: 'Available', color: AppTheme.success),
+                              if (isSelected) ...[
+                                const SizedBox(width: 8),
+                                const Icon(Icons.check_circle_rounded,
+                                    color: AppTheme.primary, size: 20),
+                              ],
+                            ]),
+                          ),
+                        );
+                      },
+                    ),
+        ),
+      ]),
+    );
+  }
+}
+
 // ─── Borrow Request Screen ─────────────────────────────────────────────────────
 
 class BorrowRequestScreen extends StatefulWidget {
   final String? equipmentName;
   final String equipmentId; // Firebase doc ID is a String
-  const BorrowRequestScreen({super.key, this.equipmentName, this.equipmentId = ''});
+  // Full equipment record when the student arrives from the catalog, so the
+  // confirmation card can show the photo without re-reading the document.
+  final Map<String, dynamic>? equipment;
+  const BorrowRequestScreen({
+    super.key,
+    this.equipmentName,
+    this.equipmentId = '',
+    this.equipment,
+  });
   @override
   State<BorrowRequestScreen> createState() => _BorrowRequestScreenState();
 }
@@ -4442,6 +5200,11 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
   // Selected equipment — Firebase doc ID stored as String
   String _selectedEquipmentId   = '';
   String _selectedEquipmentName = '';
+  // Full record of the selection, so the student can check the photo and the
+  // identifying details before submitting and avoid requesting the wrong item.
+  Map<String, dynamic> _selectedEquipment = {};
+
+  String _sel(String key) => '${_selectedEquipment[key] ?? ''}';
 
   // Borrow time — default now, return time — default 5:00 PM
   TimeOfDay _borrowTime = TimeOfDay.now();
@@ -4501,6 +5264,15 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
     // Pre-fill if coming from catalog
     _selectedEquipmentId   = widget.equipmentId;
     _selectedEquipmentName = widget.equipmentName ?? '';
+    _selectedEquipment     = widget.equipment ?? {};
+    // Arrived with an id but no record (e.g. an older call site) — fetch just
+    // that document so the confirmation card still shows the photo.
+    if (_selectedEquipmentId.isNotEmpty && _selectedEquipment.isEmpty) {
+      ApiService.getEquipmentById(_selectedEquipmentId).then((match) {
+        if (!mounted || match == null) return;
+        setState(() => _selectedEquipment = match);
+      }).catchError((_) {});
+    }
   }
 
   @override
@@ -4514,135 +5286,18 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
 
   // Opens a bottom sheet to pick equipment from the catalog
   Future<void> _pickEquipment() async {
-    List<dynamic> items = [];
-    bool loading = true;
-
-    await showModalBottomSheet(
+    final picked = await showModalBottomSheet<Map<String, dynamic>>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheetState) {
-          // Load equipment on first open
-          if (loading) {
-            ApiService.getEquipment().then((data) {
-              setSheetState(() {
-                items = data.where((e) => e['status'] == 'Available').toList();
-                loading = false;
-              });
-            }).catchError((_) {
-              setSheetState(() => loading = false);
-            });
-          }
-
-          return Container(
-            height: MediaQuery.of(context).size.height * 0.75,
-            decoration: const BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-            ),
-            child: Column(children: [
-              // Handle
-              Container(
-                margin: const EdgeInsets.only(top: 12),
-                width: 40, height: 4,
-                decoration: BoxDecoration(
-                    color: AppTheme.divider,
-                    borderRadius: BorderRadius.circular(2)),
-              ),
-              const SizedBox(height: 12),
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 20),
-                child: Row(children: [
-                  Icon(Icons.science_outlined, color: AppTheme.primary, size: 20),
-                  SizedBox(width: 10),
-                  Text('Select Equipment',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold,
-                          color: AppTheme.textDark)),
-                ]),
-              ),
-              const SizedBox(height: 4),
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 20),
-                child: Text('Only available equipment is shown.',
-                    style: TextStyle(fontSize: 12, color: AppTheme.textMid)),
-              ),
-              const SizedBox(height: 12),
-              const Divider(color: AppTheme.divider, height: 1),
-              Expanded(
-                child: loading
-                    ? const Center(child: CircularProgressIndicator())
-                    : items.isEmpty
-                        ? const Center(
-                            child: Text('No available equipment.',
-                                style: TextStyle(color: AppTheme.textMid)))
-                        : ListView.separated(
-                            padding: const EdgeInsets.all(16),
-                            itemCount: items.length,
-                            separatorBuilder: (_, _) => const SizedBox(height: 8),
-                            itemBuilder: (_, i) {
-                              final e = items[i];
-                              final isSelected = _selectedEquipmentId ==
-                                  '${e['equipment_id']}';
-                              return GestureDetector(
-                                onTap: () {
-                                  setState(() {
-                                    _selectedEquipmentId   = '${e['equipment_id']}';
-                                    _selectedEquipmentName = e['equipment_name'] as String;
-                                  });
-                                  Navigator.pop(ctx);
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.all(14),
-                                  decoration: BoxDecoration(
-                                    color: isSelected
-                                        ? const Color(0x121B3A8C)
-                                        : Colors.white,
-                                    borderRadius: BorderRadius.circular(14),
-                                    border: Border.all(
-                                        color: isSelected
-                                            ? AppTheme.primary
-                                            : AppTheme.divider),
-                                  ),
-                                  child: Row(children: [
-                                    Container(
-                                      width: 40, height: 40,
-                                      decoration: BoxDecoration(
-                                          color: const Color(0x1A06D6A0),
-                                          borderRadius: BorderRadius.circular(10)),
-                                      child: const Icon(Icons.science_outlined,
-                                          color: AppTheme.success, size: 20),
-                                    ),
-                                    const SizedBox(width: 12),
-                                    Expanded(child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: [
-                                      Text(e['equipment_name'] as String,
-                                          style: const TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 14,
-                                              color: AppTheme.textDark)),
-                                      Text('${e['qr_code']}  •  ${e['category']}',
-                                          style: const TextStyle(
-                                              fontSize: 12, color: AppTheme.textMid)),
-                                    ])),
-                                    StatusBadge(label: 'Available', color: AppTheme.success),
-                                    if (isSelected) ...[
-                                      const SizedBox(width: 8),
-                                      const Icon(Icons.check_circle_rounded,
-                                          color: AppTheme.primary, size: 20),
-                                    ],
-                                  ]),
-                                ),
-                              );
-                            },
-                          ),
-              ),
-            ]),
-          );
-        },
-      ),
+      builder: (_) => _EquipmentPickerSheet(selectedId: _selectedEquipmentId),
     );
+    if (picked == null) return;
+    setState(() {
+      _selectedEquipmentId   = '${picked['equipment_id']}';
+      _selectedEquipmentName = picked['equipment_name'] as String;
+      _selectedEquipment     = picked;
+    });
   }
 
   Future<void> _submitRequest() async {
@@ -4729,7 +5384,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}'), backgroundColor: AppTheme.danger,
+        SnackBar(content: Text(ApiService._friendlyError(e)), backgroundColor: AppTheme.danger,
             duration: const Duration(seconds: 6)));
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -4761,22 +5416,22 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
                             : AppTheme.success.withValues(alpha: 0.3))),
                 child: Row(
                   children: [
-                    Container(
-                      width: 48, height: 48,
-                      decoration: BoxDecoration(
-                          color: (_selectedEquipmentId.isEmpty
-                                  ? AppTheme.accent
-                                  : AppTheme.success)
-                              .withValues(alpha: 0.12),
-                          borderRadius: BorderRadius.circular(12)),
-                      child: Icon(
-                          _selectedEquipmentId.isEmpty
-                              ? Icons.add_circle_outline_rounded
-                              : Icons.science_outlined,
-                          color: _selectedEquipmentId.isEmpty
-                              ? AppTheme.accent
-                              : AppTheme.success),
-                    ),
+                    if (_selectedEquipmentId.isEmpty)
+                      Container(
+                        width: 48, height: 48,
+                        decoration: BoxDecoration(
+                            color: AppTheme.accent.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(12)),
+                        child: const Icon(Icons.add_circle_outline_rounded,
+                            color: AppTheme.accent),
+                      )
+                    else
+                      EquipmentThumb(
+                        bytes: photoThumbOf(_selectedEquipment),
+                        category: _sel('category'),
+                        color: AppTheme.success,
+                        size: 64,
+                      ),
                     const SizedBox(width: 14),
                     Expanded(
                       child: Column(
@@ -4794,10 +5449,32 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
                                     : AppTheme.textDark),
                           ),
                           const SizedBox(height: 2),
+                          // Identifying details, so two similar-looking items
+                          // are not mistaken for one another.
+                          if (_selectedEquipmentId.isNotEmpty) ...[
+                            if (_sel('qr_code').isNotEmpty)
+                              Text(
+                                [_sel('qr_code'), _sel('category')]
+                                    .where((s) => s.isNotEmpty)
+                                    .join('  •  '),
+                                style: const TextStyle(
+                                    fontSize: 12, color: AppTheme.textMid),
+                              ),
+                            if (_sel('brand').isNotEmpty ||
+                                _sel('model').isNotEmpty)
+                              Text(
+                                [_sel('brand'), _sel('model')]
+                                    .where((s) => s.isNotEmpty)
+                                    .join(' '),
+                                style: const TextStyle(
+                                    fontSize: 12, color: AppTheme.textMid),
+                              ),
+                            const SizedBox(height: 2),
+                          ],
                           Text(
                             _selectedEquipmentId.isEmpty
                                 ? 'Required — choose from available equipment'
-                                : 'Tap to change selection',
+                                : 'Check the photo, then tap to change selection',
                             style: const TextStyle(
                                 fontSize: 12, color: AppTheme.textMid),
                           ),
@@ -4817,15 +5494,15 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
             const SizedBox(height: 20),
             _FieldLabel('Borrower Name'),
             const SizedBox(height: 8),
-            TextField(controller: _nameCtrl, decoration: const InputDecoration(hintText: 'Juan Santos')),
+            TextField(controller: _nameCtrl, decoration: const InputDecoration(hintText: 'e.g. Juan Santos')),
             const SizedBox(height: 16),
             _FieldLabel('Student ID'),
             const SizedBox(height: 8),
-            TextField(controller: _idCtrl, decoration: const InputDecoration(hintText: '26-12345-123')),
+            TextField(controller: _idCtrl, decoration: const InputDecoration(hintText: 'e.g. 26-12345-123')),
             const SizedBox(height: 16),
             _FieldLabel('Subject / Section'),
             const SizedBox(height: 8),
-            TextField(controller: _subjectCtrl, decoration: const InputDecoration(hintText: 'PHYS101 - Sec A')),
+            TextField(controller: _subjectCtrl, decoration: const InputDecoration(hintText: 'e.g. PHYS101 - Sec A')),
             const SizedBox(height: 16),
             _FieldLabel('Quantity'),
             const SizedBox(height: 8),
@@ -5698,25 +6375,9 @@ class MyBorrowingsScreen extends StatefulWidget {
 }
 
 class _MyBorrowingsScreenState extends State<MyBorrowingsScreen> {
-  bool _loading = true;
-  List<dynamic> _all = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    setState(() => _loading = true);
-    try {
-      final data = await ApiService.getMyBorrowings(
-          studentId: Session.studentId, studentNumber: Session.studentNumber);
-      setState(() { _all = data; _loading = false; });
-    } catch (_) {
-      setState(() => _loading = false);
-    }
-  }
+  // Live Firestore stream: the lists update by themselves when staff approve,
+  // reject or process a return — no pull-to-refresh needed.
+  late final Stream<List<dynamic>> _stream = ApiService.myBorrowingsStream();
 
   Color _statusColor(String s) {
     switch (s) {
@@ -5730,32 +6391,47 @@ class _MyBorrowingsScreenState extends State<MyBorrowingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    return StreamBuilder<List<dynamic>>(
+      stream: _stream,
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snap.hasError) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('My Borrowings')),
+            body: const Center(
+                child: Text('Could not load your borrowings.',
+                    style: TextStyle(color: AppTheme.textMid))),
+          );
+        }
+        final all = snap.data ?? const [];
+        final active  = all.where((e) => e['status'] == 'Approved').toList();
+        final pending = all.where((e) => e['status'] == 'Pending').toList();
+        final history = all.where((e) => e['status'] == 'Returned' || e['status'] == 'Rejected').toList();
 
-    final active   = _all.where((e) => e['status'] == 'Approved').toList();
-    final pending  = _all.where((e) => e['status'] == 'Pending').toList();
-    final history  = _all.where((e) => e['status'] == 'Returned' || e['status'] == 'Rejected').toList();
-
-    return DefaultTabController(
-      length: 3,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('My Borrowings'),
-          bottom: const TabBar(
-            indicatorColor: AppTheme.accent,
-            labelColor: Colors.white,
-            unselectedLabelColor: AppTheme.textLight,
-            tabs: [Tab(text: 'Active'), Tab(text: 'Pending'), Tab(text: 'History')],
+        return DefaultTabController(
+          length: 3,
+          child: Scaffold(
+            appBar: AppBar(
+              title: const Text('My Borrowings'),
+              bottom: const TabBar(
+                indicatorColor: AppTheme.accent,
+                labelColor: Colors.white,
+                unselectedLabelColor: AppTheme.textLight,
+                tabs: [Tab(text: 'Active'), Tab(text: 'Pending'), Tab(text: 'History')],
+              ),
+            ),
+            body: TabBarView(
+              children: [
+                _LiveBorrowList(items: active, statusColorFn: _statusColor),
+                _LiveBorrowList(items: pending, statusColorFn: _statusColor),
+                _LiveBorrowList(items: history, statusColorFn: _statusColor),
+              ],
+            ),
           ),
-        ),
-        body: TabBarView(
-          children: [
-            _LiveBorrowList(items: active, statusColorFn: _statusColor, onRefresh: _load),
-            _LiveBorrowList(items: pending, statusColorFn: _statusColor, onRefresh: _load),
-            _LiveBorrowList(items: history, statusColorFn: _statusColor, onRefresh: _load),
-          ],
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -5763,22 +6439,25 @@ class _MyBorrowingsScreenState extends State<MyBorrowingsScreen> {
 class _LiveBorrowList extends StatelessWidget {
   final List<dynamic> items;
   final Color Function(String) statusColorFn;
-  final VoidCallback onRefresh;
-  const _LiveBorrowList({required this.items, required this.statusColorFn, required this.onRefresh});
+  const _LiveBorrowList({required this.items, required this.statusColorFn});
 
   @override
   Widget build(BuildContext context) {
     if (items.isEmpty) {
-      return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        const Icon(Icons.inbox_rounded, size: 48, color: AppTheme.textLight),
-        const SizedBox(height: 8),
-        const Text('No items', style: TextStyle(color: AppTheme.textMid)),
-        const SizedBox(height: 12),
-        TextButton.icon(onPressed: onRefresh, icon: const Icon(Icons.refresh), label: const Text('Refresh')),
+      return const Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+        Icon(Icons.inbox_rounded, size: 48, color: AppTheme.textLight),
+        SizedBox(height: 8),
+        Text('No items', style: TextStyle(color: AppTheme.textMid)),
+        SizedBox(height: 12),
+        Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.sync_rounded, size: 14, color: AppTheme.textLight),
+          SizedBox(width: 6),
+          Text('Updates automatically', style: TextStyle(fontSize: 12, color: AppTheme.textLight)),
+        ]),
       ]));
     }
-    return RefreshIndicator(
-      onRefresh: () async => onRefresh(),
+    return Material(
+      color: Colors.transparent,
       child: ListView.separated(
         padding: const EdgeInsets.all(16),
         itemCount: items.length,
@@ -5794,12 +6473,11 @@ class _LiveBorrowList extends StatelessWidget {
               children: [
                 Row(
                   children: [
-                    Container(
-                      width: 46, height: 46,
-                      decoration: BoxDecoration(
-                          color: const Color(0x141B3A8C),
-                          borderRadius: BorderRadius.circular(12)),
-                      child: const Icon(Icons.science_outlined, color: AppTheme.primary),
+                    EquipmentThumb(
+                      bytes: photoThumbOf(e),
+                      category: e['category'] as String? ?? '',
+                      color: AppTheme.primary,
+                      size: 46,
                     ),
                     const SizedBox(width: 14),
                     Expanded(
@@ -5978,7 +6656,7 @@ class _DamageReportScreenState extends State<DamageReportScreen> {
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Error: ${e.toString()}'),
+          content: Text(ApiService._friendlyError(e)),
           backgroundColor: AppTheme.danger,
           behavior: SnackBarBehavior.floating));
     } finally {
@@ -6690,7 +7368,8 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
             _passwordField(
               controller: _currentCtrl,
               label: 'Current Password',
-              hint: '••••••••',
+              hint: 'Enter current password', // not bullets — see login field
+
               obscure: _obscureCurrent,
               onToggle: () => setState(() => _obscureCurrent = !_obscureCurrent),
             ),
@@ -6742,12 +7421,40 @@ class NotificationsSettingsScreen extends StatefulWidget {
 }
 
 class _NotificationsSettingsScreenState extends State<NotificationsSettingsScreen> {
-  bool _borrowApproved  = true;
-  bool _borrowRejected  = true;
-  bool _dueSoon         = true;
-  bool _overdue         = true;
-  bool _returnConfirmed = true;
-  bool _damageUpdate    = false;
+  bool _borrowApproved  = NotifPrefs.approved;
+  bool _borrowRejected  = NotifPrefs.rejected;
+  bool _dueSoon         = NotifPrefs.dueSoon;
+  bool _overdue         = NotifPrefs.overdue;
+  bool _returnConfirmed = NotifPrefs.returnConfirmed;
+  bool _damageUpdate    = NotifPrefs.damageUpdate;
+
+  @override
+  void initState() {
+    super.initState();
+    // Re-read from disk in case this screen is opened before the dashboard
+    // has loaded the preferences.
+    NotifPrefs.load().then((_) {
+      if (!mounted) return;
+      setState(() {
+        _borrowApproved  = NotifPrefs.approved;
+        _borrowRejected  = NotifPrefs.rejected;
+        _dueSoon         = NotifPrefs.dueSoon;
+        _overdue         = NotifPrefs.overdue;
+        _returnConfirmed = NotifPrefs.returnConfirmed;
+        _damageUpdate    = NotifPrefs.damageUpdate;
+      });
+    });
+  }
+
+  Future<void> _save() async {
+    NotifPrefs.approved        = _borrowApproved;
+    NotifPrefs.rejected        = _borrowRejected;
+    NotifPrefs.dueSoon         = _dueSoon;
+    NotifPrefs.overdue         = _overdue;
+    NotifPrefs.returnConfirmed = _returnConfirmed;
+    NotifPrefs.damageUpdate    = _damageUpdate;
+    await NotifPrefs.save();
+  }
 
   Widget _notifTile({
     required String title,
@@ -6838,7 +7545,9 @@ class _NotificationsSettingsScreenState extends State<NotificationsSettingsScree
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
-                onPressed: () {
+                onPressed: () async {
+                  await _save();
+                  if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
                       content: Text('Notification preferences saved!'),
@@ -7328,29 +8037,16 @@ class _AdminHomeState extends State<_AdminHome> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final equipment = await ApiService.getEquipment();
-      final requests  = await ApiService.getRequests();
-      final damage    = await ApiService.openDamageReportCount();
-      final now = DateTime.now();
+      final data = await ApiService.getDashboardData();
+      if (!mounted) return;
       setState(() {
-        _stats = {
-          'pending_requests':    requests.where((e) => e['status'] == 'Pending').length,
-          'active_loans':        requests.where((e) => e['status'] == 'Approved').length,
-          'overdue_loans':       requests.where((e) {
-            if (e['status'] != 'Approved') return false;
-            final due = DateTime.tryParse('${e['due_date']}'.replaceAll(' ', 'T'));
-            return due != null && due.isBefore(now);
-          }).length,
-          'total_equipment':     equipment.length,
-          'available_equipment': equipment.where((e) => e['status'] == 'Available').length,
-          'damage_reports':      damage,
-        };
-        _pending  = requests.where((e) => e['status'] == 'Pending').toList();
-        _approved = requests.where((e) => e['status'] == 'Approved').toList();
+        _stats    = data.stats;
+        _pending  = data.pending;
+        _approved = data.approved;
         _loading  = false;
       });
     } catch (_) {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -7579,6 +8275,22 @@ class _AdminHomeState extends State<_AdminHome> {
                               color: AppTheme.primary)),
                         ]),
                       ),
+                      const SizedBox(height: 12),
+                      IntrinsicHeight(
+                        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                          Expanded(child: _AdminStatCard(
+                              label: 'Registered Students',
+                              value: '${_stats['total_students'] ?? 0}',
+                              icon: Icons.people_alt_rounded,
+                              color: AppTheme.primary)),
+                          const SizedBox(width: 12),
+                          Expanded(child: _AdminStatCard(
+                              label: 'Students on Hold',
+                              value: '${_stats['held_students'] ?? 0}',
+                              icon: Icons.gpp_bad_rounded,
+                              color: AppTheme.danger)),
+                        ]),
+                      ),
                       const SizedBox(height: 24),
 
                       // ── Scan QR for Return (manage rights only) ──
@@ -7624,6 +8336,22 @@ class _AdminHomeState extends State<_AdminHome> {
                           ),
                         )),
                       ]),
+                      const SizedBox(height: 12),
+                      // ── Students directory (all staff; viewer is read-only) ──
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () => Navigator.push(context,
+                              MaterialPageRoute(builder: (_) => const AdminStudentsScreen())),
+                          icon: const Icon(Icons.people_alt_outlined, size: 18),
+                          label: const Text('Students'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppTheme.primary,
+                            side: const BorderSide(color: AppTheme.primary),
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                          ),
+                        ),
+                      ),
                       const SizedBox(height: 24),
 
                       // ── Pending Approvals ──
@@ -7855,19 +8583,9 @@ class AdminRequestsScreen extends StatefulWidget {
 }
 
 class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
-  bool _loading = true;
-  List<dynamic> _all = [];
-
-  @override
-  void initState() { super.initState(); WidgetsBinding.instance.addPostFrameCallback((_) => _load()); }
-
-  Future<void> _load() async {
-    setState(() => _loading = true);
-    try {
-      final data = await ApiService.getRequests();
-      setState(() { _all = data; _loading = false; });
-    } catch (_) { setState(() => _loading = false); }
-  }
+  // Live Firestore stream: new requests pop in as students submit them and
+  // status changes render immediately — no manual refresh.
+  late final Stream<List<dynamic>> _stream = ApiService.requestsStream();
 
   Color _statusColor(String s) {
     switch (s) {
@@ -7889,7 +8607,7 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
           behavior: SnackBarBehavior.floating,
         ));
       }
-      _load();
+      // No manual reload needed — the snapshot stream delivers the change.
     } catch (_) {}
   }
 
@@ -7923,6 +8641,22 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
       ),
     );
     if (ok == true) _action(txId, 'reject', reason: reasonCtrl.text.trim());
+  }
+
+  // One-line "who processed this" note built from the audit fields stamped on
+  // the transaction (approved/rejected/returned by which staff member).
+  String _auditLine(dynamic e) {
+    final status = '${e['status'] ?? ''}';
+    if (status == 'Approved' && '${e['approved_by_name'] ?? ''}'.isNotEmpty) {
+      return 'Approved by ${e['approved_by_name']}';
+    }
+    if (status == 'Rejected' && '${e['rejected_by_name'] ?? ''}'.isNotEmpty) {
+      return 'Rejected by ${e['rejected_by_name']}';
+    }
+    if (status == 'Returned' && '${e['returned_by_name'] ?? ''}'.isNotEmpty) {
+      return 'Returned to ${e['returned_by_name']}';
+    }
+    return '';
   }
 
   Widget _buildCard(dynamic e, {bool showActions = false}) {
@@ -7972,6 +8706,16 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
                     color: AppTheme.danger,
                     fontStyle: FontStyle.italic)),
           ],
+          // Audit trail — who acted on this request/loan.
+          if (_auditLine(e).isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Row(children: [
+              const Icon(Icons.badge_outlined, size: 12, color: AppTheme.textLight),
+              const SizedBox(width: 4),
+              Expanded(child: Text(_auditLine(e),
+                  style: const TextStyle(fontSize: 10, color: AppTheme.textLight))),
+            ]),
+          ],
           if (showActions && status == 'Pending' && Session.canManage) ...[
             const SizedBox(height: 10),
             Row(children: [
@@ -7995,38 +8739,53 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     );
   }
 
+  Widget _requestList(List<dynamic> items, String emptyText,
+      {bool showActions = false}) {
+    return ListView(padding: const EdgeInsets.all(16),
+        children: items.isEmpty
+            ? [Center(child: Padding(padding: const EdgeInsets.all(32), child: Text(emptyText, style: const TextStyle(color: AppTheme.textMid))))]
+            : items.map((e) => _buildCard(e, showActions: showActions)).toList());
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    final pending  = _all.where((e) => e['status'] == 'Pending').toList();
-    final approved = _all.where((e) => e['status'] == 'Approved').toList();
+    return StreamBuilder<List<dynamic>>(
+      stream: _stream,
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snap.hasError) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('Requests')),
+            body: const Center(
+                child: Text('Could not load requests.',
+                    style: TextStyle(color: AppTheme.textMid))),
+          );
+        }
+        final all = snap.data ?? const [];
+        final pending  = all.where((e) => e['status'] == 'Pending').toList();
+        final approved = all.where((e) => e['status'] == 'Approved').toList();
 
-    return DefaultTabController(
-      length: 3,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Requests'),
-          bottom: const TabBar(
-            indicatorColor: AppTheme.accent, labelColor: Colors.white,
-            unselectedLabelColor: AppTheme.textLight,
-            tabs: [Tab(text: 'Pending'), Tab(text: 'Approved'), Tab(text: 'All')],
+        return DefaultTabController(
+          length: 3,
+          child: Scaffold(
+            appBar: AppBar(
+              title: const Text('Requests'),
+              bottom: const TabBar(
+                indicatorColor: AppTheme.accent, labelColor: Colors.white,
+                unselectedLabelColor: AppTheme.textLight,
+                tabs: [Tab(text: 'Pending'), Tab(text: 'Approved'), Tab(text: 'All')],
+              ),
+            ),
+            body: TabBarView(children: [
+              _requestList(pending, 'No pending requests', showActions: true),
+              _requestList(approved, 'No approved requests'),
+              _requestList(all, 'No requests yet'),
+            ]),
           ),
-        ),
-        body: TabBarView(children: [
-          RefreshIndicator(onRefresh: _load, child: ListView(padding: const EdgeInsets.all(16),
-            children: pending.isEmpty
-                ? [const Center(child: Padding(padding: EdgeInsets.all(32), child: Text('No pending requests', style: TextStyle(color: AppTheme.textMid))))]
-                : pending.map((e) => _buildCard(e, showActions: true)).toList())),
-          RefreshIndicator(onRefresh: _load, child: ListView(padding: const EdgeInsets.all(16),
-            children: approved.isEmpty
-                ? [const Center(child: Padding(padding: EdgeInsets.all(32), child: Text('No approved requests', style: TextStyle(color: AppTheme.textMid))))]
-                : approved.map((e) => _buildCard(e)).toList())),
-          RefreshIndicator(onRefresh: _load, child: ListView(padding: const EdgeInsets.all(16),
-            children: _all.isEmpty
-                ? [const Center(child: Padding(padding: EdgeInsets.all(32), child: Text('No requests yet', style: TextStyle(color: AppTheme.textMid))))]
-                : _all.map((e) => _buildCard(e)).toList())),
-        ]),
-      ),
+        );
+      },
     );
   }
 }
@@ -8046,18 +8805,97 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   bool _loading = true;
   bool _hasError = false;
   String _search = '';
+  // TODO(scalability): this category filter is single-select, so unlike the
+  // student catalog's multi-select it COULD run server-side as
+  //   .where('category', isEqualTo: _filter).orderBy('equipment_name')
+  // which would stop the list paging through non-matching items. It needs a
+  // composite index (category + equipment_name) created in the Firebase
+  // console first — the query fails until that index finishes building, so it
+  // was deliberately left client-side rather than risk it close to the
+  // defense. The borrow picker's 'Available' filter needs the same treatment
+  // (status + equipment_name). Do both in one pass when there is time to
+  // verify the indexes.
   String _filter = 'All';
   final _categories = ['All', ..._kCategories];
 
+  // Pagination — see ApiService.getEquipmentPage. The header counts come from
+  // aggregation queries so they stay true for the whole inventory, not just
+  // the pages loaded so far.
+  static const int _pageSize = 20;
+  final _scrollController = ScrollController();
+  DocumentSnapshot? _cursor;
+  bool _hasMore = true;
+  bool _loadingMore = false;
+  int _totalItems = 0;
+  int _availableItems = 0;
+
   @override
-  void initState() { super.initState(); WidgetsBinding.instance.addPostFrameCallback((_) => _load()); }
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_onScroll);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _load());
+  }
+
+  @override
+  void dispose() {
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    final pos = _scrollController.position;
+    if (pos.pixels >= pos.maxScrollExtent - 400) _loadMore();
+  }
 
   Future<void> _load() async {
-    setState(() { _loading = true; _hasError = false; });
+    setState(() {
+      _loading = true;
+      _hasError = false;
+      _equipment = [];
+      _cursor = null;
+      _hasMore = true;
+    });
     try {
-      final data = await ApiService.getEquipment();
-      setState(() { _equipment = data; _loading = false; });
-    } catch (_) { setState(() { _loading = false; _hasError = true; }); }
+      // Both start before either is awaited, so they run concurrently.
+      final pageFuture   = ApiService.getEquipmentPage(limit: _pageSize);
+      final countsFuture = ApiService.getEquipmentCounts();
+      final page   = await pageFuture;
+      final counts = await countsFuture;
+      if (!mounted) return;
+      setState(() {
+        _equipment = page.items;
+        _cursor = page.cursor;
+        _hasMore = page.hasMore;
+        _totalItems = counts.total;
+        _availableItems = counts.available;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() { _loading = false; _hasError = true; });
+    }
+  }
+
+  Future<void> _loadMore() async {
+    if (_loadingMore || !_hasMore || _loading) return;
+    setState(() => _loadingMore = true);
+    try {
+      final page = await ApiService.getEquipmentPage(
+          limit: _pageSize, startAfter: _cursor);
+      if (!mounted) return;
+      setState(() {
+        _equipment = [..._equipment, ...page.items];
+        _cursor = page.cursor ?? _cursor;
+        _hasMore = page.hasMore;
+        _loadingMore = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      // Keep what is loaded; scrolling again retries.
+      setState(() => _loadingMore = false);
+    }
   }
 
   Color _conditionColor(String c) {
@@ -8068,36 +8906,46 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
     }
   }
 
-  IconData _equipmentIcon(String category) {
-    switch (category.toLowerCase()) {
-      case 'electronics':     return Icons.electric_bolt_rounded;
-      case 'tools':           return Icons.build_rounded;
-      case 'measurement':     return Icons.straighten_rounded;
-      case 'optics':          return Icons.remove_red_eye_rounded;
-      case 'microcontroller': return Icons.memory_rounded;
-      default:                return Icons.science_outlined;
-    }
-  }
+  Widget _thumb(Map<String, dynamic> e, Color condColor) => EquipmentThumb(
+        bytes: photoThumbOf(e),
+        category: e['category'] as String? ?? '',
+        color: condColor,
+        size: 48,
+      );
 
-  // Equipment thumbnail — shows the uploaded photo, falling back to a
-  // category icon when there is none / it fails to load.
-  Widget _thumb(Map<String, dynamic> e, Color condColor) {
-    final url = e['image_url'] as String? ?? '';
-    final fallback = Container(
-      width: 48, height: 48,
-      decoration: BoxDecoration(
-          color: condColor.withValues(alpha: 0.10),
-          borderRadius: BorderRadius.circular(12)),
-      child: Icon(_equipmentIcon(e['category'] as String? ?? ''),
-          color: condColor, size: 24),
-    );
-    if (url.isEmpty) return fallback;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
-      child: Image.network(url,
-          width: 48, height: 48, fit: BoxFit.cover,
-          errorBuilder: (c, err, s) => fallback),
-    );
+  // Trailing row of the inventory list: paging spinner, empty-result message,
+  // or a quiet end-of-list marker.
+  Widget _listFooter(bool isEmpty) {
+    if (_loadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 20),
+        child: Center(
+          child: SizedBox(
+              width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)),
+        ),
+      );
+    }
+    if (isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.only(top: 60),
+        child: Column(children: [
+          Icon(Icons.inventory_2_outlined, size: 52, color: AppTheme.textLight),
+          SizedBox(height: 12),
+          Text('No equipment found',
+              style: TextStyle(color: AppTheme.textMid, fontSize: 14)),
+        ]),
+      );
+    }
+    if (!_hasMore) {
+      return const Padding(
+        padding: EdgeInsets.only(top: 16),
+        child: Center(
+          child: Text('End of inventory',
+              style: TextStyle(fontSize: 11, color: AppTheme.textLight)),
+        ),
+      );
+    }
+    return const SizedBox(height: 4);
   }
 
   void _openEdit(Map<String, dynamic> equipment) {
@@ -8182,9 +9030,18 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
       return matchCat && matchSearch;
     }).toList();
 
-    final totalItems     = _equipment.length;
-    final availableItems = _equipment.where((e) => e['status'] == 'Available').length;
+    // Counted server-side over the whole collection — the list below is only a
+    // page of it, so these cannot be derived from _equipment.
+    final totalItems       = _totalItems;
+    final availableItems   = _availableItems;
     final unavailableItems = totalItems - availableItems;
+
+    // An active search or category can hide everything loaded so far while
+    // matches remain further down the collection; pull more until the list
+    // fills or the inventory runs out.
+    if (filtered.length < _pageSize && _hasMore && !_loadingMore && !_loading) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    }
 
     return Scaffold(
       backgroundColor: AppTheme.surface,
@@ -8259,22 +9116,16 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
 
           // ── Equipment list ──
           Expanded(
-            child: filtered.isEmpty
-                ? const Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.inventory_2_outlined, size: 52, color: AppTheme.textLight),
-                        SizedBox(height: 12),
-                        Text('No equipment found', style: TextStyle(color: AppTheme.textMid, fontSize: 14)),
-                      ],
-                    ),
-                  )
-                : ListView.separated(
+            child: ListView.separated(
+                    controller: _scrollController,
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
-                    itemCount: filtered.length,
+                    // One extra row for the paging footer.
+                    itemCount: filtered.length + 1,
                     separatorBuilder: (_, _) => const SizedBox(height: 10),
                     itemBuilder: (_, i) {
+                      if (i == filtered.length) {
+                        return _listFooter(filtered.isEmpty);
+                      }
                       final e = filtered[i];
                       final status = e['status'] ?? 'Available';
                       final condColor = _conditionColor(status);
@@ -8443,11 +9294,11 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
     }
     setState(() => _saving = true);
     try {
-      String imageUrl = widget.equipment['image_url'] as String? ?? '';
+      String? photoError;
       if (_pickedImage != null) {
         final bytes = await _pickedImage!.readAsBytes();
-        final url = await ApiService.uploadEquipmentImage(equipmentId, bytes);
-        if (url != null && url.isNotEmpty) imageUrl = url;
+        final saved = await ApiService.saveEquipmentPhoto(equipmentId, bytes);
+        photoError = saved.error;
       }
       final res = await ApiService.updateEquipment(equipmentId, {
         'equipment_name': _nameCtrl.text.trim(),
@@ -8459,15 +9310,21 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
         'serial_number':  _serialCtrl.text.trim(),
         'description':    _descCtrl.text.trim(),
         'courses':        _selectedCourses,
-        'image_url':      imageUrl,
       });
       if (!mounted) return;
       if (res['success'] == true) {
+        final messenger = ScaffoldMessenger.of(context);
         Navigator.pop(context);
         widget.onSaved();
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Equipment updated successfully.'),
-            backgroundColor: AppTheme.success));
+        messenger.showSnackBar(photoError == null
+            ? const SnackBar(
+                content: Text('Equipment updated successfully.'),
+                backgroundColor: AppTheme.success)
+            : SnackBar(
+                content: Text('Equipment updated, but the photo did not '
+                    'upload: $photoError'),
+                backgroundColor: AppTheme.warning,
+                duration: const Duration(seconds: 6)));
       } else {
         setState(() => _saving = false);
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -8548,11 +9405,11 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                       ),
                     ),
                   ])
-                else if ((widget.equipment['image_url'] as String? ?? '').isNotEmpty)
+                else if (photoThumbOf(widget.equipment) != null)
                   ClipRRect(
                     borderRadius: BorderRadius.circular(12),
-                    child: Image.network(
-                      widget.equipment['image_url'] as String,
+                    child: Image.memory(
+                      photoThumbOf(widget.equipment)!,
                       height: 160, width: double.infinity, fit: BoxFit.cover,
                       errorBuilder: (context, error, stack) => const SizedBox.shrink(),
                     ),
@@ -8832,7 +9689,9 @@ class _EquipmentRegistrationScreenState
   final _modelCtrl = TextEditingController();
   final _serialCtrl = TextEditingController();
   final _locationCtrl = TextEditingController();
-  final _qtyCtrl = TextEditingController();
+  // Pre-filled: the centred hintText '1' was indistinguishable from a real
+  // value, so the form looked complete but failed validation with "Required".
+  final _qtyCtrl = TextEditingController(text: '1');
 
   XFile? _pickedImage;
   final _imagePicker = ImagePicker();
@@ -8904,21 +9763,19 @@ class _EquipmentRegistrationScreenState
         'model':          _modelCtrl.text.trim(),
         'serial_number':  _serialCtrl.text.trim(),
         'qr_code':        _generatedQr,
-        'image_url':      '',
       });
       if (!mounted) return;
       if (res['success'] == true) {
-        // Upload image if one was captured
+        // Store the photo once the document exists and its id is known.
+        String? photoError;
         if (_pickedImage != null) {
           final bytes = await _pickedImage!.readAsBytes();
-          final url = await ApiService.uploadEquipmentImage(
+          final saved = await ApiService.saveEquipmentPhoto(
               res['equipment_id'] as String, bytes);
-          if (url != null && url.isNotEmpty) {
-            await ApiService.updateEquipment(
-                res['equipment_id'] as String, {'image_url': url});
-          }
+          photoError = saved.error;
         }
         if (!mounted) return;
+        final messenger = ScaffoldMessenger.of(context);
         Navigator.pop(context); // close loading
         Navigator.pop(context, {
           'equipment_name': _nameCtrl.text.trim(),
@@ -8927,6 +9784,14 @@ class _EquipmentRegistrationScreenState
           'status':         'Available',
           'location':       _locationCtrl.text.trim(),
         });
+        if (photoError != null) {
+          messenger.showSnackBar(SnackBar(
+            content: Text('Equipment saved, but the photo could not be '
+                'stored: $photoError'),
+            backgroundColor: AppTheme.warning,
+            duration: const Duration(seconds: 6),
+          ));
+        }
       } else {
         Navigator.pop(context); // close loading
         ScaffoldMessenger.of(context).showSnackBar(
@@ -9496,6 +10361,11 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
   bool _loading = true;
   bool _exporting = false;
 
+  // Reporting window. Borrowing figures below cover this many days back, not
+  // all time — see the note in _load(). Surfaced in the UI and the exported
+  // report so the numbers are never read as lifetime totals.
+  static const int _reportPeriodDays = 90;
+
   // Live stats
   int _totalBorrowings   = 0;
   int _totalReturned     = 0;
@@ -9519,9 +10389,16 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final txSnap = await ApiService.getRequests();
-      final eqList = await ApiService.getEquipment();
-      final damageReports = await ApiService.getDamageReports();
+      // Scoped to a reporting period rather than all-time: borrow_transactions
+      // grows forever, so an unbounded read here gets more expensive every
+      // semester. Equipment and damage totals are counted server-side.
+      final cutoff = DateTime.now().subtract(Duration(days: _reportPeriodDays));
+      final txF     = ApiService.getRequestsSince(cutoff);
+      final eqF     = ApiService.getEquipmentCounts();
+      final damageF = ApiService.damageReportCount();
+      final txSnap        = await txF;
+      final eqCounts      = await eqF;
+      final damageReports = await damageF;
 
       // Count borrowing stats
       final now = DateTime.now();
@@ -9555,8 +10432,8 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
         _totalBorrowings  = total;
         _totalReturned    = returned;
         _totalOverdue     = overdue;
-        _totalDamage      = damageReports.length;
-        _totalEquipment   = eqList.length;
+        _totalDamage      = damageReports;
+        _totalEquipment   = eqCounts.total;
         _onTimeRate       = onTime;
         _mostBorrowed     = top4;
         _allTransactions  = txSnap;
@@ -9586,8 +10463,12 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
       buf.writeln('  Generated: $dateStr at $timeStr');
       buf.writeln('==============================================');
       buf.writeln('');
-      buf.writeln('SUMMARY');
+      buf.writeln('SUMMARY  (last $_reportPeriodDays days)');
       buf.writeln('----------------------------------------------');
+      buf.writeln('Borrowing figures below cover the last '
+          '$_reportPeriodDays days. Equipment and damage report');
+      buf.writeln('totals are current counts.');
+      buf.writeln('');
       buf.writeln('Total Borrowings   : $_totalBorrowings');
       buf.writeln('Total Returned     : $_totalReturned');
       buf.writeln('Total Overdue      : $_totalOverdue');
@@ -9731,6 +10612,19 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+
+              // Borrowing figures are scoped to a period, not all-time.
+              Row(children: [
+                const Icon(Icons.event_note_outlined,
+                    size: 14, color: AppTheme.textMid),
+                const SizedBox(width: 6),
+                Text('Borrowing activity — last $_reportPeriodDays days',
+                    style: const TextStyle(
+                        fontSize: 12,
+                        color: AppTheme.textMid,
+                        fontWeight: FontWeight.w600)),
+              ]),
+              const SizedBox(height: 12),
 
               // ── Summary Cards ──
               Row(children: [
@@ -10305,5 +11199,481 @@ class _AdminPenaltiesScreenState extends State<AdminPenaltiesScreen> {
         ],
       ]),
     );
+  }
+}
+
+// ─── Admin Students Directory ─────────────────────────────────────────────────
+// Staff-only, searchable list of registered students. Tapping one opens their
+// detail view. Viewers can browse it read-only. The security rules already let
+// any staff member read the students collection while blocking student-to-
+// student reads, so this exposes no more than staff already handle on every
+// borrow request.
+class AdminStudentsScreen extends StatefulWidget {
+  const AdminStudentsScreen({super.key});
+  @override
+  State<AdminStudentsScreen> createState() => _AdminStudentsScreenState();
+}
+
+class _AdminStudentsScreenState extends State<AdminStudentsScreen> {
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+  bool _loading = true;
+  List<dynamic> _all = [];
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  @override
+  void dispose() { _searchCtrl.dispose(); super.dispose(); }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    try {
+      final data = await ApiService.getStudents();
+      if (!mounted) return;
+      setState(() { _all = data; _loading = false; });
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  List<dynamic> get _filtered {
+    final q = _query.trim().toLowerCase();
+    if (q.isEmpty) return _all;
+    return _all.where((s) {
+      final name = '${s['name'] ?? ''}'.toLowerCase();
+      final number = '${s['student_number'] ?? ''}'.toLowerCase();
+      return name.contains(q) || number.contains(q);
+    }).toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Students')),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: TextField(
+            controller: _searchCtrl,
+            onChanged: (v) => setState(() => _query = v),
+            decoration: InputDecoration(
+              hintText: 'Search by name or student number',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _query.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () { _searchCtrl.clear(); setState(() => _query = ''); },
+                    ),
+              isDense: true,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(28)),
+            ),
+          ),
+        ),
+        if (!_loading)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text('${_filtered.length} student${_filtered.length == 1 ? '' : 's'}',
+                  style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+            ),
+          ),
+        Expanded(
+          child: _loading
+              ? const Center(child: CircularProgressIndicator())
+              : RefreshIndicator(
+                  onRefresh: _load,
+                  child: _filtered.isEmpty
+                      ? ListView(children: [
+                          const SizedBox(height: 80),
+                          Center(child: Text(
+                            _query.isEmpty
+                                ? 'No students registered yet.'
+                                : 'No students match "$_query".',
+                            style: const TextStyle(color: AppTheme.textMid))),
+                        ])
+                      : ListView.separated(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: _filtered.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 10),
+                          itemBuilder: (_, i) => _studentTile(_filtered[i]),
+                        ),
+                ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _studentTile(dynamic s) {
+    final name = '${s['name'] ?? 'Student'}';
+    final onHold = s['hold'] == true;
+    return Container(
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(14)),
+      child: ListTile(
+        onTap: () async {
+          await Navigator.push(context, MaterialPageRoute(
+              builder: (_) => AdminStudentDetailScreen(student: Map<String, dynamic>.from(s))));
+          _load(); // reflect any hold change made in the detail view
+        },
+        leading: CircleAvatar(
+          radius: 22,
+          backgroundColor: const Color(0x141B3A8C),
+          child: Text(_initials(name),
+              style: const TextStyle(color: AppTheme.primary, fontWeight: FontWeight.bold)),
+        ),
+        title: Text(name,
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
+        subtitle: Text('${s['student_number'] ?? ''}  •  ${courseLabel('${s['course'] ?? ''}')}',
+            style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+        trailing: onHold
+            ? StatusBadge(label: 'On Hold', color: AppTheme.danger)
+            : const Icon(Icons.arrow_forward_ios_rounded, size: 14, color: AppTheme.textLight),
+      ),
+    );
+  }
+
+  String _initials(String name) {
+    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
+    if (parts.isEmpty) return '?';
+    if (parts.length == 1) return parts[0][0].toUpperCase();
+    return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
+  }
+}
+
+// ─── Admin Student Detail ─────────────────────────────────────────────────────
+// One student's profile, borrowing history, and — for staff who can manage —
+// hold and password-reset actions. Viewers see everything but no action buttons.
+class AdminStudentDetailScreen extends StatefulWidget {
+  final Map<String, dynamic> student;
+  const AdminStudentDetailScreen({super.key, required this.student});
+  @override
+  State<AdminStudentDetailScreen> createState() => _AdminStudentDetailScreenState();
+}
+
+class _AdminStudentDetailScreenState extends State<AdminStudentDetailScreen> {
+  late Map<String, dynamic> _student;
+  List<dynamic> _txns = [];
+  bool _loadingTxns = true;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _student = Map<String, dynamic>.from(widget.student);
+    _loadTxns();
+  }
+
+  String get _sid => '${_student['student_id'] ?? ''}';
+
+  Future<void> _loadTxns() async {
+    setState(() => _loadingTxns = true);
+    try {
+      final t = await ApiService.getStudentTransactions(_sid);
+      if (!mounted) return;
+      setState(() { _txns = t; _loadingTxns = false; });
+    } catch (_) {
+      if (mounted) setState(() => _loadingTxns = false);
+    }
+  }
+
+  Future<void> _refreshStudent() async {
+    final fresh = await ApiService.getStudent(_sid);
+    if (fresh != null && mounted) setState(() => _student = fresh);
+  }
+
+  void _snack(String msg, {bool ok = true}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      backgroundColor: ok ? AppTheme.success : AppTheme.danger,
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  Future<void> _placeHold() async {
+    final reasonCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dCtx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Place Hold'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('The student will be blocked from borrowing until the hold '
+              'is lifted. Add a reason they will see.',
+              style: TextStyle(fontSize: 13, color: AppTheme.textMid)),
+          const SizedBox(height: 12),
+          TextField(controller: reasonCtrl, maxLines: 2,
+            decoration: const InputDecoration(
+                hintText: 'e.g. Unreturned multimeter; settle with lab staff')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dCtx, false),
+              child: const Text('Cancel', style: TextStyle(color: AppTheme.textMid))),
+          ElevatedButton(onPressed: () => Navigator.pop(dCtx, true),
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.danger),
+              child: const Text('Place Hold')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _busy = true);
+    final res = await ApiService.setStudentHold(_sid, true, reason: reasonCtrl.text.trim());
+    if (mounted) setState(() => _busy = false);
+    if (res['success'] == true) { await _refreshStudent(); _snack('Hold placed.'); }
+    else { _snack(res['message'] ?? 'Failed to place hold.', ok: false); }
+  }
+
+  Future<void> _liftHold() async {
+    setState(() => _busy = true);
+    final res = await ApiService.setStudentHold(_sid, false);
+    if (mounted) setState(() => _busy = false);
+    if (res['success'] == true) { await _refreshStudent(); _snack('Hold lifted.'); }
+    else { _snack(res['message'] ?? 'Failed to lift hold.', ok: false); }
+  }
+
+  Future<void> _sendReset() async {
+    final email = '${_student['email'] ?? ''}';
+    if (email.isEmpty) { _snack('This student has no email on file.', ok: false); return; }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dCtx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Send Password Reset'),
+        content: Text('Send a password-reset email to $email?',
+            style: const TextStyle(fontSize: 13, color: AppTheme.textMid)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dCtx, false),
+              child: const Text('Cancel', style: TextStyle(color: AppTheme.textMid))),
+          ElevatedButton(onPressed: () => Navigator.pop(dCtx, true),
+              child: const Text('Send')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _busy = true);
+    final res = await ApiService.sendPasswordReset(email);
+    if (mounted) setState(() => _busy = false);
+    _snack(res['success'] == true
+        ? 'Reset email sent to $email.'
+        : (res['message'] ?? 'Could not send reset email.'),
+        ok: res['success'] == true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final onHold = _student['hold'] == true;
+    final name = '${_student['name'] ?? 'Student'}';
+    return Scaffold(
+      appBar: AppBar(title: const Text('Student')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        // Header
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+          child: Row(children: [
+            CircleAvatar(radius: 28, backgroundColor: const Color(0x141B3A8C),
+              child: Text(_initials(name),
+                  style: const TextStyle(color: AppTheme.primary, fontWeight: FontWeight.bold, fontSize: 18))),
+            const SizedBox(width: 14),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: AppTheme.textDark)),
+              const SizedBox(height: 2),
+              Text('${_student['student_number'] ?? ''}',
+                  style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+            ])),
+            if (onHold) StatusBadge(label: 'On Hold', color: AppTheme.danger),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        // Info rows (each is its own card)
+        _DetailRow(label: 'Program', value: courseLabel('${_student['course'] ?? ''}')),
+        _DetailRow(label: 'Year Level', value: '${_student['year_level'] ?? '-'}'),
+        _DetailRow(label: 'Email', value: '${_student['email'] ?? '-'}'),
+        _DetailRow(label: 'Member Since', value: _memberSince()),
+        // Reliability summary (once history has loaded)
+        if (!_loadingTxns) ...[
+          const SizedBox(height: 4),
+          _reliabilityCard(),
+        ],
+        // Hold reason
+        if (onHold && '${_student['hold_reason'] ?? ''}'.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0x14E53935), borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0x33E53935))),
+            child: Row(children: [
+              const Icon(Icons.gpp_bad_outlined, color: AppTheme.danger, size: 18),
+              const SizedBox(width: 10),
+              Expanded(child: Text('${_student['hold_reason']}',
+                  style: const TextStyle(fontSize: 12, color: AppTheme.textDark))),
+            ]),
+          ),
+        ],
+        // Actions — managers only; viewers see the info above but no buttons.
+        if (Session.canManage) ...[
+          const SizedBox(height: 16),
+          if (onHold)
+            SizedBox(width: double.infinity, child: ElevatedButton.icon(
+              onPressed: _busy ? null : _liftHold,
+              icon: const Icon(Icons.lock_open_rounded, size: 16),
+              label: const Text('Lift Hold'),
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
+            ))
+          else
+            SizedBox(width: double.infinity, child: ElevatedButton.icon(
+              onPressed: _busy ? null : _placeHold,
+              icon: const Icon(Icons.gpp_maybe_outlined, size: 16),
+              label: const Text('Place Hold'),
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.danger),
+            )),
+          const SizedBox(height: 10),
+          SizedBox(width: double.infinity, child: OutlinedButton.icon(
+            onPressed: _busy ? null : _sendReset,
+            icon: const Icon(Icons.mail_outline_rounded, size: 16),
+            label: const Text('Send Password Reset'),
+            style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.primary, side: const BorderSide(color: AppTheme.primary)),
+          )),
+        ],
+        const SizedBox(height: 24),
+        SectionHeader(
+          title: 'Borrowing History',
+          action: _txns.isEmpty ? null : 'Export',
+          onAction: _txns.isEmpty ? null : _exportHistory,
+        ),
+        const SizedBox(height: 10),
+        if (_loadingTxns)
+          const Center(child: Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator()))
+        else if (_txns.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+            child: const Center(child: Text('No borrowing records.',
+                style: TextStyle(color: AppTheme.textMid, fontSize: 13))),
+          )
+        else
+          ..._txns.map(_txnCard),
+        const SizedBox(height: 20),
+      ]),
+    );
+  }
+
+  Widget _reliabilityCard() {
+    final r = ApiService.studentReliability(_txns);
+    final rating = '${r['rating']}';
+    final color = rating == 'Good'
+        ? AppTheme.success
+        : rating == 'Fair'
+            ? AppTheme.warning
+            : AppTheme.danger;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Text('Reliability',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
+          const Spacer(),
+          StatusBadge(label: rating, color: color),
+        ]),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(child: _relStat('${r['loans']}', 'Loans', AppTheme.primary)),
+          Expanded(child: _relStat('${r['late']}', 'Late', AppTheme.warning)),
+          Expanded(child: _relStat('${r['overdue']}', 'Overdue', AppTheme.danger)),
+          Expanded(child: _relStat('${r['damages']}', 'Damages', AppTheme.danger)),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _relStat(String value, String label, Color color) => Column(children: [
+        Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: color)),
+        const SizedBox(height: 2),
+        Text(label, style: const TextStyle(fontSize: 10, color: AppTheme.textMid)),
+      ]);
+
+  Future<void> _exportHistory() async {
+    final buf = StringBuffer();
+    buf.writeln('LabTrack — Student Borrowing History');
+    buf.writeln('=====================================');
+    buf.writeln('Name        : ${_student['name'] ?? ''}');
+    buf.writeln('Student No. : ${_student['student_number'] ?? ''}');
+    buf.writeln('Program     : ${courseLabel('${_student['course'] ?? ''}')}');
+    buf.writeln('Year Level  : ${_student['year_level'] ?? '-'}');
+    final r = ApiService.studentReliability(_txns);
+    buf.writeln('Reliability : ${r['rating']} '
+        '(loans ${r['loans']}, late ${r['late']}, overdue ${r['overdue']}, damages ${r['damages']})');
+    buf.writeln('Generated   : ${DateTime.now()}');
+    buf.writeln('');
+    buf.writeln('Transactions (${_txns.length}):');
+    if (_txns.isEmpty) {
+      buf.writeln('  (none)');
+    } else {
+      for (final e in _txns) {
+        final name = '${e['equipment_name'] ?? 'Equipment'}';
+        final status = '${e['status'] ?? ''}';
+        final borrow = '${e['borrow_date'] ?? ''}'.split('T').first;
+        final due = '${e['due_date'] ?? ''}'.split('T').first;
+        buf.writeln('  - $name | $status | borrowed $borrow | due $due');
+      }
+    }
+    await Clipboard.setData(ClipboardData(text: buf.toString()));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('History copied to clipboard. Paste into Notes or email.'),
+      backgroundColor: AppTheme.success,
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  Widget _txnCard(dynamic e) {
+    final status = '${e['status'] ?? ''}';
+    final color = status == 'Approved' ? AppTheme.success
+        : status == 'Pending' ? AppTheme.accent
+        : status == 'Rejected' ? AppTheme.danger
+        : AppTheme.textMid;
+    final borrow = '${e['borrow_date'] ?? ''}'.split('T').first;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(14)),
+      child: Row(children: [
+        const Icon(Icons.science_outlined, size: 18, color: AppTheme.textMid),
+        const SizedBox(width: 10),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${e['equipment_name'] ?? 'Equipment'}',
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: AppTheme.textDark)),
+          if (borrow.isNotEmpty)
+            Text('Borrowed: $borrow',
+                style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
+        ])),
+        StatusBadge(label: status, color: color),
+      ]),
+    );
+  }
+
+  String _initials(String name) {
+    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
+    if (parts.isEmpty) return '?';
+    if (parts.length == 1) return parts[0][0].toUpperCase();
+    return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
+  }
+
+  String _memberSince() {
+    final raw = _student['created_at'];
+    DateTime? dt;
+    if (raw is Timestamp) {
+      dt = raw.toDate();
+    } else {
+      dt = DateTime.tryParse('$raw');
+    }
+    if (dt == null) return '-';
+    return '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
   }
 }
