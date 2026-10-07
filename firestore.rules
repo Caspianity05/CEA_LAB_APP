@@ -29,23 +29,34 @@ service cloud.firestore {
     }
 
     // Public lookup so a student can resolve their student number → email
-    // BEFORE authenticating. Holds only {email, uid}; nothing sensitive.
+    // BEFORE authenticating. Holds only {email, uid}. Hardened:
+    //   • get-only — list is blocked so the collection cannot be dumped to
+    //     harvest student emails (Data Privacy Act of 2012 consideration).
+    //   • create must carry the caller's own uid and token email, so one
+    //     account cannot "squat" another student's number.
+    //   • a student may delete only their own mapping (registration rollback).
     match /student_lookup/{studentNumber} {
-      allow read:   if true;
-      allow create: if signedIn();
-      allow update, delete: if false;
+      allow get:    if true;
+      allow list:   if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['email', 'uid'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.email;
+      allow update: if false;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
     }
 
-    // Student profiles. A student may read/create/update only their own doc,
-    // but may NOT change their own hold/penalty fields. Staff may read all;
-    // managers may write (e.g. to place or lift a hold).
+    // Student profiles. A student may read/create only their own doc, and may
+    // self-update ONLY the editable profile fields — never hold/penalty
+    // fields, their student number, or their email. Staff may read all;
+    // managers may write anything (e.g. to place or lift a hold).
     match /students/{uid} {
       allow read:   if request.auth.uid == uid || isStaff();
       allow create: if request.auth.uid == uid;
       allow update: if isManager()
         || (request.auth.uid == uid
-            && request.resource.data.hold == resource.data.hold
-            && request.resource.data.hold_reason == resource.data.hold_reason);
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['name', 'course', 'year_level']));
       allow delete: if isManager();
     }
 
@@ -57,6 +68,7 @@ service cloud.firestore {
     }
 
     // Equipment is readable by any signed-in user; only managers may change it.
+    // The small list thumbnail is stored on the document itself as photo_thumb.
     match /equipment/{id} {
       allow read:   if signedIn();
       allow create: if isManager();
@@ -64,13 +76,27 @@ service cloud.firestore {
       allow delete: if isManager();
     }
 
+    // Full-size equipment photos, one document per equipment item, keyed by the
+    // equipment id. Held here rather than in Cloud Storage because Storage
+    // requires the paid Blaze plan; these are only read when a detail screen
+    // opens, so they stay out of every list query.
+    match /equipment_photos/{id} {
+      allow read:   if signedIn();
+      allow write:  if isManager();
+    }
+
     // Borrow transactions: a student creates and reads their own; staff read all;
-    // only managers may approve/reject/return (update).
+    // only managers may approve/reject/return (update). Creation is hardened so
+    // the business rules hold even against a raw-API caller, not just in the app:
+    //   • new requests always start Pending — a client cannot self-approve;
+    //   • students under a penalty hold cannot create requests at all.
     match /borrow_transactions/{id} {
       allow read:   if isStaff()
         || (signedIn() && resource.data.student_id == request.auth.uid);
       allow create: if signedIn()
-        && request.resource.data.student_id == request.auth.uid;
+        && request.resource.data.student_id == request.auth.uid
+        && request.resource.data.status == 'Pending'
+        && get(/databases/$(database)/documents/students/$(request.auth.uid)).data.hold != true;
       allow update: if isManager();
       allow delete: if false;
     }

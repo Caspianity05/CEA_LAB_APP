@@ -30,7 +30,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  http: ^0.13.6
   mobile_scanner: ^5.2.3
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
@@ -39,7 +38,10 @@ dependencies:
   firebase_auth: ^5.3.1
   cloud_firestore: ^5.4.3
   image_picker: ^1.1.2
-  firebase_storage: ^12.3.7
+  # Pure-Dart resize/JPEG encode. Equipment photos are stored in Firestore
+  # (Cloud Storage needs the paid Blaze plan), so each photo is re-encoded to a
+  # small thumbnail for lists and a larger copy for the detail screen.
+  image: ^4.2.0
   qr_flutter: ^4.1.0
   shared_preferences: ^2.3.2
 

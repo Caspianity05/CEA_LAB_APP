@@ -27,6 +27,22 @@ firebase deploy --only firestore:rules,storage
 - `storage.rules` — equipment images: signed-in users read; only non-viewer
   staff write.
 
+> **2026-07-25 hardening — redeploy required.** The rules now also enforce,
+> server-side:
+> - `borrow_transactions` create must have `status == 'Pending'` (no
+>   self-approval via the raw API) and is blocked while the student is on a
+>   penalty hold;
+> - `student_lookup` is **get-only** (no list — the collection can't be dumped
+>   to harvest student emails), create must carry the caller's own uid + token
+>   email (no squatting someone else's student number), and a student may
+>   delete only their own mapping (registration rollback);
+> - students may self-update only `name`, `course`, `year_level` — never
+>   hold fields, student number, or email.
+>
+> The app relies on the create-only lookup rule for its race-proof
+> student-number uniqueness check, so **deploy these rules together with (or
+> before) the matching app build**.
+
 You can also paste the file contents into **Firebase Console → Firestore →
 Rules** and **Storage → Rules** and click *Publish*.
 
