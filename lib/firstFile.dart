@@ -10,6 +10,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'theme.dart';
+import 'constants.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DEMO MODE — CLOSED as of 2026-08-02.
@@ -1148,37 +1149,6 @@ class ApiService {
     }
   }
 }
-
-// ─── Shared constants ─────────────────────────────────────────────────────────
-// Engineering programs/courses offered by CEA. Equipment can be tagged with the
-// programs allowed to borrow it (Prof recommendation #1 — categorize by program).
-// The short code is what gets stored on the student/equipment records; the full
-// program name (see _kCourseNames) is what we show in the UI.
-const _kCourses = ['CE', 'ME', 'ECE', 'EE', 'IE', 'Arch'];
-
-// Human-readable program names, keyed by the stored course code.
-const _kCourseNames = {
-  'CE':   'Civil Engineering',
-  'ME':   'Mechanical Engineering',
-  'ECE':  'Electronics Engineering',
-  'EE':   'Electrical Engineering',
-  'IE':   'Industrial Engineering',
-  'Arch': 'Architecture',
-};
-
-// Friendly label for a course code, e.g. 'CE' → 'Civil Engineering'.
-// Falls back to the raw code for any legacy/unknown value.
-String courseLabel(String code) => _kCourseNames[code] ?? code;
-
-// Equipment categories — single source of truth shared by the catalog, inventory
-// filter, registration and edit screens so the lists never drift apart.
-const _kCategories = [
-  'Electronics', 'Optics', 'Measurement', 'Tools',
-  'Microcontroller', 'Safety', 'Other',
-];
-
-// Equipment availability / condition statuses.
-const _kStatuses = ['Available', 'Borrowed', 'Under Repair', 'For Disposal'];
 
 // ─── Session (simple in-memory user state) ───────────────────────────────────
 class Session {
@@ -2793,7 +2763,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                                         contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 14)),
                                     hint: const Text('Select course'),
                                     isExpanded: true,
-                                    items: _kCourses.map((c) => DropdownMenuItem(value: c, child: Text(courseLabel(c)))).toList(),
+                                    items: kCourses.map((c) => DropdownMenuItem(value: c, child: Text(courseLabel(c)))).toList(),
                                     onChanged: (v) => setState(() => _selectedCourse = v),
                                   ),
                                 ],
@@ -3889,7 +3859,7 @@ class EquipmentCatalogScreen extends StatefulWidget {
 class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
   String _search = '';
   final Set<String> _selectedCategories = {};
-  final _categories = _kCategories;
+  final _categories = kCategories;
   bool _dropdownOpen = false;
   bool _showAllCourses = false;
   bool _loading = true;
@@ -6877,7 +6847,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
     super.initState();
     _nameCtrl = TextEditingController(text: Session.name);
     final stored = Session.currentUser?['course'] as String?;
-    _selectedCourse = _kCourses.contains(stored) ? stored : null;
+    _selectedCourse = kCourses.contains(stored) ? stored : null;
     _yearCtrl = TextEditingController(text: '${Session.currentUser?['year_level'] ?? ''}');
   }
 
@@ -7025,7 +6995,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                   prefixIcon: Icon(Icons.school_outlined, color: AppTheme.textMid)),
               hint: const Text('Select course'),
               isExpanded: true,
-              items: _kCourses.map((c) => DropdownMenuItem(value: c, child: Text(courseLabel(c)))).toList(),
+              items: kCourses.map((c) => DropdownMenuItem(value: c, child: Text(courseLabel(c)))).toList(),
               onChanged: (v) => setState(() => _selectedCourse = v),
             ),
             const SizedBox(height: 16),
@@ -8630,7 +8600,7 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   // (status + equipment_name). Do both in one pass when there is time to
   // verify the indexes.
   String _filter = 'All';
-  final _categories = ['All', ..._kCategories];
+  final _categories = ['All', ...kCategories];
 
   // Pagination — see ApiService.getEquipmentPage. The header counts come from
   // aggregation queries so they stay true for the whole inventory, not just
@@ -9067,8 +9037,8 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
   bool _saving = false;
 
   final _imagePicker = ImagePicker();
-  final _statuses    = _kStatuses;
-  final _categories  = _kCategories;
+  final _statuses    = kStatuses;
+  final _categories  = kCategories;
 
   @override
   void initState() {
@@ -9379,7 +9349,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 const SizedBox(height: 8),
                 Wrap(
                   spacing: 8, runSpacing: 6,
-                  children: _kCourses.map((c) {
+                  children: kCourses.map((c) {
                     final sel = _selectedCourses.contains(c);
                     return FilterChip(
                       label: Text(courseLabel(c), style: TextStyle(
@@ -9517,7 +9487,7 @@ class _EquipmentRegistrationScreenState
   String _generatedId = '';
   String _generatedQr = '';
 
-  final _categories = _kCategories;
+  final _categories = kCategories;
   final _conditions = ['Good', 'Fair', 'Under Repair', 'For Disposal'];
 
   String? _validateRequired(String? v) =>
@@ -9808,7 +9778,7 @@ class _EquipmentRegistrationScreenState
                 Wrap(
                   spacing: 8,
                   runSpacing: 6,
-                  children: _kCourses.map((c) {
+                  children: kCourses.map((c) {
                     final selected = _selectedCourses.contains(c);
                     return FilterChip(
                       label: Text(courseLabel(c), style: TextStyle(fontSize: 12, color: selected ? Colors.white : AppTheme.textDark)),

@@ -3,6 +3,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:cea_lab_app/constants.dart';
 import 'package:cea_lab_app/firstFile.dart';
 
 void main() {
