@@ -3,8 +3,10 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
+// These now import only the service layer and shared constants — the pure
+// business logic no longer pulls in the UI module at all.
 import 'package:cea_lab_app/constants.dart';
-import 'package:cea_lab_app/firstFile.dart';
+import 'package:cea_lab_app/services/api_service.dart';
 
 void main() {
   group('Due-date policy (same-day 5:00 PM cap)', () {
