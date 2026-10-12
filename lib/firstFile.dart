@@ -11,6 +11,7 @@ import 'theme.dart';
 import 'constants.dart';
 import 'services/api_service.dart';
 import 'services/session.dart';
+import 'widgets/common.dart';
 
 // ─── Notification preferences ────────────────────────────────────────────────
 // Persisted in shared_preferences and honoured by the student dashboard's
@@ -58,132 +59,6 @@ class LabBorrowApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.lightTheme,
       home: const SplashScreen(),
-    );
-  }
-}
-
-// ─── Shared Widgets ───────────────────────────────────────────────────────────
-
-class StatusBadge extends StatelessWidget {
-  final String label;
-  final Color color;
-  const StatusBadge({super.key, required this.label, required this.color});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.13),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withValues(alpha: 0.4)),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: color,
-          fontSize: 11,
-          fontWeight: FontWeight.bold,
-          letterSpacing: 0.4,
-        ),
-      ),
-    );
-  }
-}
-
-IconData equipmentIcon(String category) {
-  switch (category.toLowerCase()) {
-    case 'electronics':     return Icons.electric_bolt_rounded;
-    case 'tools':           return Icons.build_rounded;
-    case 'measurement':     return Icons.straighten_rounded;
-    case 'optics':          return Icons.remove_red_eye_rounded;
-    case 'microcontroller': return Icons.memory_rounded;
-    default:                return Icons.science_outlined;
-  }
-}
-
-// Pulls the stored thumbnail out of an equipment (or transaction) record.
-// Firestore hands back a Blob; anything else means no photo. Takes dynamic so
-// call sites reading from List<dynamic> need no casts.
-Uint8List? photoThumbOf(dynamic record) {
-  if (record is! Map) return null;
-  final v = record['photo_thumb'];
-  return v is Blob ? v.bytes : null;
-}
-
-// Equipment photo thumbnail. Students rely on the photo to confirm they are
-// requesting — and being handed — the right item, so every list that names a
-// piece of equipment should show it. Falls back to a category icon when no
-// photo was uploaded or the bytes cannot be decoded.
-class EquipmentThumb extends StatelessWidget {
-  final Uint8List? bytes;
-  final String category;
-  final Color color;
-  final double size;
-  const EquipmentThumb({
-    super.key,
-    required this.bytes,
-    required this.category,
-    required this.color,
-    this.size = 48,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final radius = size / 4;
-    final fallback = Container(
-      width: size, height: size,
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(radius),
-      ),
-      child: Icon(equipmentIcon(category), color: color, size: size / 2),
-    );
-    final data = bytes;
-    if (data == null || data.isEmpty) return fallback;
-    // Decode straight to the display size rather than the stored 192px: a list
-    // of these otherwise holds full-resolution bitmaps in memory.
-    final cachePx =
-        (size * MediaQuery.devicePixelRatioOf(context)).round();
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(radius),
-      child: Image.memory(
-        data,
-        width: size, height: size, fit: BoxFit.cover,
-        cacheWidth: cachePx,
-        gaplessPlayback: true,
-        errorBuilder: (_, _, _) => fallback,
-      ),
-    );
-  }
-}
-
-class SectionHeader extends StatelessWidget {
-  final String title;
-  final String? action;
-  final VoidCallback? onAction;
-  const SectionHeader({super.key, required this.title, this.action, this.onAction});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(title,
-            style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-                color: AppTheme.textDark)),
-        if (action != null)
-          GestureDetector(
-            onTap: onAction,
-            child: Text(action!,
-                style: const TextStyle(
-                    fontSize: 13,
-                    color: AppTheme.accent,
-                    fontWeight: FontWeight.w600)),
-          ),
-      ],
     );
   }
 }
@@ -1365,7 +1240,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                         const SizedBox(height: 20),
 
                         // ── SECTION: Identity Verification ──
-                        _SectionDivider(
+                        SectionDivider(
                           icon: Icons.verified_user_outlined,
                           label: 'Identity Verification',
                           color: AppTheme.accent,
@@ -1373,7 +1248,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                         const SizedBox(height: 16),
 
                         // Institutional Email
-                        _FieldLabel('NEU Email Address'),
+                        FieldLabel('NEU Email Address'),
                         const SizedBox(height: 8),
                         TextFormField(
                           controller: _emailCtrl,
@@ -1433,7 +1308,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                         const SizedBox(height: 16),
 
                         // Student ID
-                        _FieldLabel('Student ID Number'),
+                        FieldLabel('Student ID Number'),
                         const SizedBox(height: 8),
                         TextFormField(
                           controller: _studentIdCtrl,
@@ -1521,7 +1396,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                         const SizedBox(height: 28),
 
                         // ── SECTION: Personal Information ──
-                        _SectionDivider(
+                        SectionDivider(
                           icon: Icons.person_outline_rounded,
                           label: 'Personal Information',
                           color: AppTheme.primary,
@@ -1534,7 +1409,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  _FieldLabel('First Name'),
+                                  FieldLabel('First Name'),
                                   const SizedBox(height: 8),
                                   TextFormField(
                                     controller: _firstNameCtrl,
@@ -1550,7 +1425,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  _FieldLabel('Last Name'),
+                                  FieldLabel('Last Name'),
                                   const SizedBox(height: 8),
                                   TextFormField(
                                     controller: _lastNameCtrl,
@@ -1572,7 +1447,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  _FieldLabel('Course / Program'),
+                                  FieldLabel('Course / Program'),
                                   const SizedBox(height: 8),
                                   DropdownButtonFormField<String>(
                                     value: _selectedCourse,
@@ -1593,7 +1468,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  _FieldLabel('Year Level'),
+                                  FieldLabel('Year Level'),
                                   const SizedBox(height: 8),
                                   DropdownButtonFormField<String>(
                                     validator: (v) =>
@@ -1617,14 +1492,14 @@ class _SignUpScreenState extends State<SignUpScreen> {
                         const SizedBox(height: 28),
 
                         // ── SECTION: Account Security ──
-                        _SectionDivider(
+                        SectionDivider(
                           icon: Icons.lock_outline_rounded,
                           label: 'Account Security',
                           color: AppTheme.warning,
                         ),
                         const SizedBox(height: 16),
 
-                        _FieldLabel('Password'),
+                        FieldLabel('Password'),
                         const SizedBox(height: 8),
                         TextFormField(
                           controller: _passCtrl,
@@ -1647,7 +1522,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                         ),
                         const SizedBox(height: 16),
 
-                        _FieldLabel('Confirm Password'),
+                        FieldLabel('Confirm Password'),
                         const SizedBox(height: 8),
                         TextFormField(
                           controller: _confirmPassCtrl,
@@ -1783,45 +1658,6 @@ class _SignUpScreenState extends State<SignUpScreen> {
 }
 
 // ── Sign Up helper widgets ──
-
-class _SectionDivider extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  const _SectionDivider(
-      {required this.icon, required this.label, required this.color});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Container(
-          width: 30,
-          height: 30,
-          decoration: BoxDecoration(
-            color: color.withAlpha(26),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Icon(icon, color: color, size: 16),
-        ),
-        const SizedBox(width: 10),
-        Text(label,
-            style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-                color: color)),
-        const SizedBox(width: 12),
-        const Expanded(child: Divider(color: AppTheme.divider)),
-      ],
-    );
-  }
-}
-
-Widget _FieldLabel(String label) => Text(label,
-    style: const TextStyle(
-        fontSize: 13,
-        fontWeight: FontWeight.w600,
-        color: AppTheme.textDark));
 
 class _RoleTab extends StatelessWidget {
   final String label;
@@ -2307,12 +2143,12 @@ class _StudentDashboardState extends State<_StudentDashboard> {
 
                       // ── Alerts / Notifications ──────────────────────────
                       if (_notifications.isNotEmpty) ...[
-                        _SectionTitle(title: 'Alerts', icon: Icons.notifications_active_rounded,
+                        SectionTitle(title: 'Alerts', icon: Icons.notifications_active_rounded,
                             color: const Color(0xFFEF4444)),
                         const SizedBox(height: 10),
                         ..._notifications.take(3).map((n) => Padding(
                           padding: const EdgeInsets.only(bottom: 8),
-                          child: _AlertCard(
+                          child: AlertCard(
                             icon:  n['icon'] as IconData,
                             color: n['color'] as Color,
                             title: n['title'] as String,
@@ -2323,7 +2159,7 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                       ],
 
                       // ── Quick Actions ────────────────────────────────────
-                      _SectionTitle(title: 'Quick Actions',
+                      SectionTitle(title: 'Quick Actions',
                           icon: Icons.flash_on_rounded,
                           color: const Color(0xFFF5A623)),
                       const SizedBox(height: 12),
@@ -2366,7 +2202,7 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          _SectionTitle(title: 'Active Loans',
+                          SectionTitle(title: 'Active Loans',
                               icon: Icons.inventory_2_rounded,
                               color: const Color(0xFF1B3A8C)),
                           if (_activeLoans.isNotEmpty || _pendingLoans.isNotEmpty)
@@ -2385,7 +2221,7 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                       const SizedBox(height: 12),
 
                       if (_activeLoans.isEmpty && _pendingLoans.isEmpty)
-                        _EmptyCard(
+                        EmptyCard(
                           icon: Icons.inventory_2_outlined,
                           title: 'No active loans',
                           subtitle: 'Tap "New Request" to borrow equipment',
@@ -2484,67 +2320,6 @@ class _HeroStat extends StatelessWidget {
   }
 }
 
-class _SectionTitle extends StatelessWidget {
-  final String title;
-  final IconData icon;
-  final Color color;
-  const _SectionTitle({required this.title, required this.icon, required this.color});
-  @override
-  Widget build(BuildContext context) {
-    return Row(children: [
-      Container(
-        width: 28, height: 28,
-        decoration: BoxDecoration(
-            color: color.withAlpha(31),
-            borderRadius: BorderRadius.circular(8)),
-        child: Icon(icon, color: color, size: 15),
-      ),
-      const SizedBox(width: 8),
-      Text(title, style: TextStyle(
-          fontSize: 14, fontWeight: FontWeight.bold, color: color)),
-    ]);
-  }
-}
-
-class _AlertCard extends StatelessWidget {
-  final IconData icon;
-  final Color color;
-  final String title, body;
-  const _AlertCard({required this.icon, required this.color,
-      required this.title, required this.body});
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border(left: BorderSide(color: color, width: 4)),
-        boxShadow: [BoxShadow(color: color.withAlpha(15),
-            blurRadius: 8, offset: const Offset(0, 2))],
-      ),
-      child: Row(children: [
-        Container(
-          width: 34, height: 34,
-          decoration: BoxDecoration(
-              color: color.withAlpha(26),
-              borderRadius: BorderRadius.circular(9)),
-          child: Icon(icon, color: color, size: 18)),
-        const SizedBox(width: 12),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: const TextStyle(
-                fontSize: 13, fontWeight: FontWeight.bold,
-                color: Color(0xFF1A1D2E))),
-            const SizedBox(height: 2),
-            Text(body, style: const TextStyle(
-                fontSize: 12, color: Color(0xFF6B7280), height: 1.3)),
-          ])),
-      ]),
-    );
-  }
-}
-
 class _ActionTile extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -2633,33 +2408,6 @@ class _LoanItemCard extends StatelessWidget {
               fontSize: 11, fontWeight: FontWeight.bold,
               color: statusColor))),
       ]),
-    );
-  }
-}
-
-class _EmptyCard extends StatelessWidget {
-  final IconData icon;
-  final String title, subtitle;
-  const _EmptyCard({required this.icon, required this.title, required this.subtitle});
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 20),
-      decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: [BoxShadow(color: const Color(0x08000000),
-              blurRadius: 8, offset: const Offset(0, 2))]),
-      child: Center(child: Column(children: [
-        Icon(icon, size: 36, color: const Color(0xFF9CA3AF)),
-        const SizedBox(height: 8),
-        Text(title, style: const TextStyle(
-            fontWeight: FontWeight.bold, fontSize: 14,
-            color: Color(0xFF374151))),
-        const SizedBox(height: 4),
-        Text(subtitle, style: const TextStyle(
-            fontSize: 12, color: Color(0xFF9CA3AF))),
-      ])),
     );
   }
 }
@@ -3438,18 +3186,18 @@ class _EquipmentDetailScreenState extends State<EquipmentDetailScreen> {
                     ),
                     child: Column(children: [
                       if (brand.isNotEmpty)
-                        _specRow('Brand / Manufacturer', brand, isFirst: true),
+                        specRow('Brand / Manufacturer', brand, isFirst: true),
                       if (model.isNotEmpty)
-                        _specRow('Model', model, isFirst: brand.isEmpty),
+                        specRow('Model', model, isFirst: brand.isEmpty),
                       if (serial.isNotEmpty)
-                        _specRow('Serial Number', serial,
+                        specRow('Serial Number', serial,
                             isFirst: brand.isEmpty && model.isEmpty),
-                      _specRow('Category', category,
+                      specRow('Category', category,
                           isFirst: brand.isEmpty && model.isEmpty && serial.isEmpty),
-                      if (location.isNotEmpty) _specRow('Storage Location', location),
-                      _specRow('Status', status, isLast: courses.isEmpty),
+                      if (location.isNotEmpty) specRow('Storage Location', location),
+                      specRow('Status', status, isLast: courses.isEmpty),
                       if (courses.isNotEmpty)
-                        _specRow('Available to', courses.map((c) => courseLabel(c)).join(', '), isLast: true),
+                        specRow('Available to', courses.map((c) => courseLabel(c)).join(', '), isLast: true),
                     ]),
                   ),
                   // ── QR Code card ──
@@ -3535,38 +3283,6 @@ class _EquipmentDetailScreenState extends State<EquipmentDetailScreen> {
       ),
     );
   }
-}
-
-Widget _specRow(String label, String value,
-    {bool isFirst = false, bool isLast = false}) {
-  return Container(
-    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-    decoration: BoxDecoration(
-      border: Border(
-        top: isFirst ? BorderSide.none : const BorderSide(color: AppTheme.divider),
-      ),
-    ),
-    child: Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SizedBox(
-          width: 130,
-          child: Text(label,
-              style: const TextStyle(
-                  fontSize: 12,
-                  color: AppTheme.textMid,
-                  fontWeight: FontWeight.w500)),
-        ),
-        Expanded(
-          child: Text(value,
-              style: const TextStyle(
-                  fontSize: 13,
-                  color: AppTheme.textDark,
-                  fontWeight: FontWeight.w600)),
-        ),
-      ],
-    ),
-  );
 }
 
 // ─── Equipment Picker Sheet ───────────────────────────────────────────────────
@@ -4094,19 +3810,19 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
               ),
             ),
             const SizedBox(height: 20),
-            _FieldLabel('Borrower Name'),
+            FieldLabel('Borrower Name'),
             const SizedBox(height: 8),
             TextField(controller: _nameCtrl, decoration: const InputDecoration(hintText: 'e.g. Juan Santos')),
             const SizedBox(height: 16),
-            _FieldLabel('Student ID'),
+            FieldLabel('Student ID'),
             const SizedBox(height: 8),
             TextField(controller: _idCtrl, decoration: const InputDecoration(hintText: 'e.g. 26-12345-123')),
             const SizedBox(height: 16),
-            _FieldLabel('Subject / Section'),
+            FieldLabel('Subject / Section'),
             const SizedBox(height: 8),
             TextField(controller: _subjectCtrl, decoration: const InputDecoration(hintText: 'e.g. PHYS101 - Sec A')),
             const SizedBox(height: 16),
-            _FieldLabel('Quantity'),
+            FieldLabel('Quantity'),
             const SizedBox(height: 8),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -4135,7 +3851,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _FieldLabel('Borrow Time'),
+                    FieldLabel('Borrow Time'),
                     const SizedBox(height: 8),
                     GestureDetector(
                       onTap: _pickBorrowTime,
@@ -4168,7 +3884,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _FieldLabel('Return Time'),
+                    FieldLabel('Return Time'),
                     const SizedBox(height: 8),
                     GestureDetector(
                       onTap: _pickReturnTime,
@@ -4239,7 +3955,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
               ]),
             ),
             const SizedBox(height: 16),
-            _FieldLabel('Purpose / Notes'),
+            FieldLabel('Purpose / Notes'),
             const SizedBox(height: 8),
             TextField(
               controller: _purposeCtrl,
@@ -5296,7 +5012,7 @@ class _DamageReportScreenState extends State<DamageReportScreen> {
             const SizedBox(height: 20),
 
             // Equipment selector — live from borrowed items
-            _FieldLabel('Equipment (Your Active Loans)'),
+            FieldLabel('Equipment (Your Active Loans)'),
             const SizedBox(height: 8),
             _loadingEquipment
                 ? Container(
@@ -5402,7 +5118,7 @@ class _DamageReportScreenState extends State<DamageReportScreen> {
             const SizedBox(height: 20),
 
             // Severity selector
-            _FieldLabel('Damage Severity'),
+            FieldLabel('Damage Severity'),
             const SizedBox(height: 10),
             Row(
               children: ['Minor', 'Moderate', 'Severe'].map((s) {
@@ -5452,7 +5168,7 @@ class _DamageReportScreenState extends State<DamageReportScreen> {
             const SizedBox(height: 20),
 
             // Description
-            _FieldLabel('Description of Damage'),
+            FieldLabel('Description of Damage'),
             const SizedBox(height: 8),
             TextField(
               controller: _descCtrl,
@@ -5793,7 +5509,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             ),
             const SizedBox(height: 16),
 
-            _FieldLabel('Full Name'),
+            FieldLabel('Full Name'),
             const SizedBox(height: 8),
             TextField(
               controller: _nameCtrl,
@@ -5804,7 +5520,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             ),
             const SizedBox(height: 16),
 
-            _FieldLabel('Course'),
+            FieldLabel('Course'),
             const SizedBox(height: 8),
             DropdownButtonFormField<String>(
               value: _selectedCourse,
@@ -5818,7 +5534,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             ),
             const SizedBox(height: 16),
 
-            _FieldLabel('Year Level'),
+            FieldLabel('Year Level'),
             const SizedBox(height: 8),
             TextField(
               controller: _yearCtrl,
@@ -5920,7 +5636,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _FieldLabel(label),
+        FieldLabel(label),
         const SizedBox(height: 8),
         TextField(
           controller: controller,
@@ -7984,7 +7700,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
             child: ListView(controller: scroll, padding: const EdgeInsets.all(20),
               children: [
                 // Photo picker
-                _FieldLabel('Equipment Photo'),
+                FieldLabel('Equipment Photo'),
                 const SizedBox(height: 8),
                 if (_pickedImage != null)
                   Stack(children: [
@@ -8055,7 +7771,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 // Status + Category
                 Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    _FieldLabel('Status *'),
+                    FieldLabel('Status *'),
                     const SizedBox(height: 8),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
@@ -8077,7 +7793,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                   ])),
                   const SizedBox(width: 12),
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    _FieldLabel('Category *'),
+                    FieldLabel('Category *'),
                     const SizedBox(height: 8),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
@@ -8101,7 +7817,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 ]),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Equipment Name *'),
+                FieldLabel('Equipment Name *'),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _nameCtrl,
@@ -8113,7 +7829,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Storage Location'),
+                FieldLabel('Storage Location'),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _locationCtrl,
@@ -8126,14 +7842,14 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
 
                 Row(children: [
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    _FieldLabel('Brand'),
+                    FieldLabel('Brand'),
                     const SizedBox(height: 8),
                     TextField(controller: _brandCtrl,
                         decoration: const InputDecoration(hintText: 'e.g. Fluke')),
                   ])),
                   const SizedBox(width: 12),
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    _FieldLabel('Model'),
+                    FieldLabel('Model'),
                     const SizedBox(height: 8),
                     TextField(controller: _modelCtrl,
                         decoration: const InputDecoration(hintText: 'e.g. 117')),
@@ -8141,7 +7857,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 ]),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Serial Number'),
+                FieldLabel('Serial Number'),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _serialCtrl,
@@ -8152,7 +7868,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Description'),
+                FieldLabel('Description'),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _descCtrl,
@@ -8163,7 +7879,7 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Available to Courses'),
+                FieldLabel('Available to Courses'),
                 const SizedBox(height: 8),
                 Wrap(
                   spacing: 8, runSpacing: 6,
@@ -8438,13 +8154,13 @@ class _EquipmentRegistrationScreenState
                 // STEP 1 — Equipment Information
                 // ══════════════════════════════════════════
 
-                _SectionDivider(
+                SectionDivider(
                     icon: Icons.inventory_2_outlined,
                     label: 'Basic Information',
                     color: AppTheme.primary),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Equipment Name *'),
+                FieldLabel('Equipment Name *'),
                 const SizedBox(height: 8),
                 TextFormField(
                   controller: _nameCtrl,
@@ -8457,7 +8173,7 @@ class _EquipmentRegistrationScreenState
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Description'),
+                FieldLabel('Description'),
                 const SizedBox(height: 8),
                 TextFormField(
                   controller: _descCtrl,
@@ -8468,7 +8184,7 @@ class _EquipmentRegistrationScreenState
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Equipment Photo'),
+                FieldLabel('Equipment Photo'),
                 const SizedBox(height: 8),
                 if (_pickedImage != null)
                   Stack(children: [
@@ -8540,7 +8256,7 @@ class _EquipmentRegistrationScreenState
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FieldLabel('Category *'),
+                          FieldLabel('Category *'),
                           const SizedBox(height: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
@@ -8566,7 +8282,7 @@ class _EquipmentRegistrationScreenState
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FieldLabel('Condition *'),
+                          FieldLabel('Condition *'),
                           const SizedBox(height: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
@@ -8591,7 +8307,7 @@ class _EquipmentRegistrationScreenState
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Available to Courses (leave empty for all)'),
+                FieldLabel('Available to Courses (leave empty for all)'),
                 const SizedBox(height: 8),
                 Wrap(
                   spacing: 8,
@@ -8613,7 +8329,7 @@ class _EquipmentRegistrationScreenState
                 ),
                 const SizedBox(height: 24),
 
-                _SectionDivider(
+                SectionDivider(
                     icon: Icons.build_circle_outlined,
                     label: 'Technical Details',
                     color: AppTheme.primary),
@@ -8625,7 +8341,7 @@ class _EquipmentRegistrationScreenState
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FieldLabel('Brand / Manufacturer'),
+                          FieldLabel('Brand / Manufacturer'),
                           const SizedBox(height: 8),
                           TextFormField(
                             controller: _brandCtrl,
@@ -8639,7 +8355,7 @@ class _EquipmentRegistrationScreenState
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FieldLabel('Model'),
+                          FieldLabel('Model'),
                           const SizedBox(height: 8),
                           TextFormField(
                             controller: _modelCtrl,
@@ -8652,7 +8368,7 @@ class _EquipmentRegistrationScreenState
                 ),
                 const SizedBox(height: 16),
 
-                _FieldLabel('Serial Number'),
+                FieldLabel('Serial Number'),
                 const SizedBox(height: 8),
                 TextFormField(
                   controller: _serialCtrl,
@@ -8663,7 +8379,7 @@ class _EquipmentRegistrationScreenState
                 ),
                 const SizedBox(height: 24),
 
-                _SectionDivider(
+                SectionDivider(
                     icon: Icons.warehouse_outlined,
                     label: 'Quantity & Location',
                     color: AppTheme.primary),
@@ -8677,7 +8393,7 @@ class _EquipmentRegistrationScreenState
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FieldLabel('Quantity *'),
+                          FieldLabel('Quantity *'),
                           const SizedBox(height: 8),
                           TextFormField(
                             controller: _qtyCtrl,
@@ -8697,7 +8413,7 @@ class _EquipmentRegistrationScreenState
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FieldLabel('Storage Location'),
+                          FieldLabel('Storage Location'),
                           const SizedBox(height: 8),
                           TextFormField(
                             controller: _locationCtrl,
@@ -8797,7 +8513,7 @@ class _EquipmentRegistrationScreenState
                 const SizedBox(height: 24),
 
                 // QR Code display
-                _SectionDivider(icon: Icons.qr_code_rounded, label: 'Generated QR Code', color: AppTheme.primary),
+                SectionDivider(icon: Icons.qr_code_rounded, label: 'Generated QR Code', color: AppTheme.primary),
                 const SizedBox(height: 16),
                 Container(
                   width: double.infinity,
@@ -8860,7 +8576,7 @@ class _EquipmentRegistrationScreenState
                 const SizedBox(height: 24),
 
                 // Equipment summary table
-                _SectionDivider(icon: Icons.summarize_outlined, label: 'Registration Summary', color: AppTheme.primary),
+                SectionDivider(icon: Icons.summarize_outlined, label: 'Registration Summary', color: AppTheme.primary),
                 const SizedBox(height: 12),
                 _DetailRow(label: 'Equipment Name', value: _nameCtrl.text),
                 _DetailRow(label: 'Equipment ID', value: _generatedId),

@@ -1158,3 +1158,12 @@ class ApiService {
     }
   }
 }
+
+// Pulls the stored thumbnail out of an equipment (or transaction) record.
+// Firestore hands back a Blob; anything else means no photo. Takes dynamic so
+// call sites reading from List<dynamic> need no casts.
+Uint8List? photoThumbOf(dynamic record) {
+  if (record is! Map) return null;
+  final v = record['photo_thumb'];
+  return v is Blob ? v.bytes : null;
+}

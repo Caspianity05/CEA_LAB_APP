@@ -1,0 +1,295 @@
+// -----------------------------------------------------------------------------
+// LabTrack - shared UI widgets
+//
+// Extracted from firstFile.dart on 2026-08-03 as step 4 of the module split.
+// Small presentational pieces used by more than one screen. Widgets belonging
+// to a single screen (_RoleTab, _HeroStat, _LoanItemCard, _PolicyReminder, ...)
+// deliberately stay behind and will travel with their screen.
+//
+// Names that were library-private are public here because they now cross a
+// library boundary. FieldLabel alone has 44 call sites.
+// -----------------------------------------------------------------------------
+
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+
+import '../theme.dart';
+
+// ─── Shared Widgets ───────────────────────────────────────────────────────────
+
+class StatusBadge extends StatelessWidget {
+  final String label;
+  final Color color;
+  const StatusBadge({super.key, required this.label, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.13),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 0.4,
+        ),
+      ),
+    );
+  }
+}
+
+IconData equipmentIcon(String category) {
+  switch (category.toLowerCase()) {
+    case 'electronics':     return Icons.electric_bolt_rounded;
+    case 'tools':           return Icons.build_rounded;
+    case 'measurement':     return Icons.straighten_rounded;
+    case 'optics':          return Icons.remove_red_eye_rounded;
+    case 'microcontroller': return Icons.memory_rounded;
+    default:                return Icons.science_outlined;
+  }
+}
+
+
+// Equipment photo thumbnail. Students rely on the photo to confirm they are
+// requesting — and being handed — the right item, so every list that names a
+// piece of equipment should show it. Falls back to a category icon when no
+// photo was uploaded or the bytes cannot be decoded.
+class EquipmentThumb extends StatelessWidget {
+  final Uint8List? bytes;
+  final String category;
+  final Color color;
+  final double size;
+  const EquipmentThumb({
+    super.key,
+    required this.bytes,
+    required this.category,
+    required this.color,
+    this.size = 48,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final radius = size / 4;
+    final fallback = Container(
+      width: size, height: size,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(radius),
+      ),
+      child: Icon(equipmentIcon(category), color: color, size: size / 2),
+    );
+    final data = bytes;
+    if (data == null || data.isEmpty) return fallback;
+    // Decode straight to the display size rather than the stored 192px: a list
+    // of these otherwise holds full-resolution bitmaps in memory.
+    final cachePx =
+        (size * MediaQuery.devicePixelRatioOf(context)).round();
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: Image.memory(
+        data,
+        width: size, height: size, fit: BoxFit.cover,
+        cacheWidth: cachePx,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => fallback,
+      ),
+    );
+  }
+}
+
+class SectionHeader extends StatelessWidget {
+  final String title;
+  final String? action;
+  final VoidCallback? onAction;
+  const SectionHeader({super.key, required this.title, this.action, this.onAction});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(title,
+            style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: AppTheme.textDark)),
+        if (action != null)
+          GestureDetector(
+            onTap: onAction,
+            child: Text(action!,
+                style: const TextStyle(
+                    fontSize: 13,
+                    color: AppTheme.accent,
+                    fontWeight: FontWeight.w600)),
+          ),
+      ],
+    );
+  }
+}
+
+class SectionDivider extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  const SectionDivider(
+      {super.key, required this.icon, required this.label, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Container(
+          width: 30,
+          height: 30,
+          decoration: BoxDecoration(
+            color: color.withAlpha(26),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Icon(icon, color: color, size: 16),
+        ),
+        const SizedBox(width: 10),
+        Text(label,
+            style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: color)),
+        const SizedBox(width: 12),
+        const Expanded(child: Divider(color: AppTheme.divider)),
+      ],
+    );
+  }
+}
+
+Widget FieldLabel(String label) => Text(label,
+    style: const TextStyle(
+        fontSize: 13,
+        fontWeight: FontWeight.w600,
+        color: AppTheme.textDark));
+
+class SectionTitle extends StatelessWidget {
+  final String title;
+  final IconData icon;
+  final Color color;
+  const SectionTitle({super.key, required this.title, required this.icon, required this.color});
+  @override
+  Widget build(BuildContext context) {
+    return Row(children: [
+      Container(
+        width: 28, height: 28,
+        decoration: BoxDecoration(
+            color: color.withAlpha(31),
+            borderRadius: BorderRadius.circular(8)),
+        child: Icon(icon, color: color, size: 15),
+      ),
+      const SizedBox(width: 8),
+      Text(title, style: TextStyle(
+          fontSize: 14, fontWeight: FontWeight.bold, color: color)),
+    ]);
+  }
+}
+
+class AlertCard extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  final String title, body;
+  const AlertCard({super.key, required this.icon, required this.color,
+      required this.title, required this.body});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border(left: BorderSide(color: color, width: 4)),
+        boxShadow: [BoxShadow(color: color.withAlpha(15),
+            blurRadius: 8, offset: const Offset(0, 2))],
+      ),
+      child: Row(children: [
+        Container(
+          width: 34, height: 34,
+          decoration: BoxDecoration(
+              color: color.withAlpha(26),
+              borderRadius: BorderRadius.circular(9)),
+          child: Icon(icon, color: color, size: 18)),
+        const SizedBox(width: 12),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: const TextStyle(
+                fontSize: 13, fontWeight: FontWeight.bold,
+                color: Color(0xFF1A1D2E))),
+            const SizedBox(height: 2),
+            Text(body, style: const TextStyle(
+                fontSize: 12, color: Color(0xFF6B7280), height: 1.3)),
+          ])),
+      ]),
+    );
+  }
+}
+
+class EmptyCard extends StatelessWidget {
+  final IconData icon;
+  final String title, subtitle;
+  const EmptyCard({super.key, required this.icon, required this.title, required this.subtitle});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 20),
+      decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [BoxShadow(color: const Color(0x08000000),
+              blurRadius: 8, offset: const Offset(0, 2))]),
+      child: Center(child: Column(children: [
+        Icon(icon, size: 36, color: const Color(0xFF9CA3AF)),
+        const SizedBox(height: 8),
+        Text(title, style: const TextStyle(
+            fontWeight: FontWeight.bold, fontSize: 14,
+            color: Color(0xFF374151))),
+        const SizedBox(height: 4),
+        Text(subtitle, style: const TextStyle(
+            fontSize: 12, color: Color(0xFF9CA3AF))),
+      ])),
+    );
+  }
+}
+
+Widget specRow(String label, String value,
+    {bool isFirst = false, bool isLast = false}) {
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+    decoration: BoxDecoration(
+      border: Border(
+        top: isFirst ? BorderSide.none : const BorderSide(color: AppTheme.divider),
+      ),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 130,
+          child: Text(label,
+              style: const TextStyle(
+                  fontSize: 12,
+                  color: AppTheme.textMid,
+                  fontWeight: FontWeight.w500)),
+        ),
+        Expanded(
+          child: Text(value,
+              style: const TextStyle(
+                  fontSize: 13,
+                  color: AppTheme.textDark,
+                  fontWeight: FontWeight.w600)),
+        ),
+      ],
+    ),
+  );
+}
+
