@@ -7,7 +7,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:cea_lab_app/firstFile.dart';
+import 'package:cea_lab_app/screens/auth/login_screen.dart';
 
 void main() {
   testWidgets('Login screen renders core controls', (WidgetTester tester) async {
