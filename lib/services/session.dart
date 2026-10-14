@@ -23,7 +23,11 @@ class Session {
 
   static String get name => currentUser?['name'] ?? 'User';
   static String get studentNumber => currentUser?['student_number'] ?? '';
-  static int get studentId => int.tryParse('${currentUser?['student_id'] ?? 0}') ?? 0;
+  // The student's Firebase Auth UID — also their `students/{uid}` doc id. It
+  // is alphanumeric: this getter used to int.parse it (a PHP/MySQL leftover),
+  // which always gave 0, so Edit Profile wrote to `students/0` and was refused
+  // for every student (QA 2026-09-19, H2).
+  static String get studentId => '${currentUser?['student_id'] ?? ''}';
   static String get course => currentUser?['course'] ?? '';
   static String get initials {
     final parts = name.trim().split(' ');

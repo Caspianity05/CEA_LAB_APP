@@ -19,13 +19,18 @@ npm install -g firebase-tools
 firebase login
 
 # from the project root (where firebase.json lives)
-firebase deploy --only firestore:rules,storage
+firebase deploy --only firestore:rules
 ```
 
 - `firestore.rules` — collection-level authorization (students, staff,
-  equipment, borrow_transactions, damage_reports, student_lookup).
-- `storage.rules` — equipment images: signed-in users read; only non-viewer
-  staff write.
+  equipment, borrow_transactions, damage_reports, student_lookup,
+  equipment_photos).
+
+> **There is no `storage.rules` any more.** Cloud Storage requires the paid
+> Blaze plan, so as of 2026-07-31 equipment photos live in Firestore instead: a
+> ~192px thumbnail as a `Blob` on the equipment document, and a ~800px copy in
+> `equipment_photos/{equipmentId}`. Deploying `,storage` will fail — `firebase.json`
+> has no storage target.
 
 > **2026-07-25 hardening — redeploy required.** The rules now also enforce,
 > server-side:
@@ -88,11 +93,18 @@ because creating a user from the client signs you in as that new user.
 
 ## 2b. Demo mode (creating dummy students per program)
 
+> ⚠️ **Demo mode is CLOSED as of 2026-08-03** — `kDemoMode` is now `false`, so
+> new sign-ups require an `@neu.edu.ph` address and a clicked verification link.
+> Accounts whose `created_at` predates `kLegacyAccountCutoff` (2026-08-03), or
+> which have no `created_at` at all, skip the verification gate — that is what
+> keeps the existing demo students working. The rest of this section describes
+> the flag's behaviour when it *is* enabled.
+
 To demo the "equipment per program/course" feature you can create one student
-per program. A flag in `lib/firstFile.dart` makes this painless:
+per program. A flag in `lib/services/api_service.dart` makes this painless:
 
 ```dart
-const bool kDemoMode = true;   // ⚠️ set to false before the final defense
+const bool kDemoMode = false;  // set to true only to re-open dummy sign-ups
 ```
 
 While `kDemoMode == true`:

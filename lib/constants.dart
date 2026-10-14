@@ -6,6 +6,22 @@
 // are now read from several libraries. No values changed.
 // -----------------------------------------------------------------------------
 
+// ─── Build identity ───────────────────────────────────────────────────────────
+// Shown on the student About screen. Until 2026-08-04 that screen carried a
+// hardcoded 'Version 1.0.0' while pubspec.yaml sat at 1.0.0+1 through every
+// build ever installed — so no two builds could be told apart on a phone, and
+// "it still shows the old behaviour" was impossible to diagnose.
+//
+// ⚠️ BUMP kAppBuild ON EVERY RELEASE BUILD, and keep pubspec.yaml's
+// `version: <kAppVersion>+<kAppBuild>` in step. Dart cannot read pubspec at
+// runtime without adding the package_info_plus plugin, which is not worth a new
+// native dependency this close to the defense.
+const kAppVersion = '1.0.5';
+const kAppBuild = 6;
+
+// What the About screen prints, e.g. "Version 1.0.1 (build 2)".
+const kAppVersionLabel = 'Version $kAppVersion (build $kAppBuild)';
+
 // ─── Shared constants ─────────────────────────────────────────────────────────
 // Engineering programs/courses offered by CEA. Equipment can be tagged with the
 // programs allowed to borrow it (Prof recommendation #1 — categorize by program).

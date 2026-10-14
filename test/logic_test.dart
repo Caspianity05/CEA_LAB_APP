@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 // business logic no longer pulls in the UI module at all.
 import 'package:cea_lab_app/constants.dart';
 import 'package:cea_lab_app/services/api_service.dart';
+import 'package:cea_lab_app/services/session.dart';
 
 void main() {
   group('Due-date policy (same-day 5:00 PM cap)', () {
@@ -80,6 +81,18 @@ void main() {
       expect(r['rating'], 'Good');
     });
 
+    test('counts only still-approved loans as active', () {
+      final r = ApiService.studentReliability([
+        {'status': 'Approved', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Approved', 'due_date': '2999-01-02T17:00:00'},
+        {'status': 'Returned', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-20T16:00:00'},
+        {'status': 'Pending'},
+        {'status': 'Rejected'},
+      ], now: now);
+      expect(r['active'], 2);
+      expect(r['loans'], 3);
+    });
+
     test('a return after the due date counts as late', () {
       final r = ApiService.studentReliability([
         {'status': 'Returned', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-21T09:00:00'},
@@ -113,6 +126,197 @@ void main() {
     });
   });
 
+  // Regression: a due time that has already passed used to be stored as-is, so
+  // the loan was overdue the instant staff approved it (QA 2026-09-19, M3).
+  group('Due-date policy (a deadline already past)', () {
+    final afternoon = DateTime(2026, 7, 25, 14, 0);
+
+    test('a requested time earlier than now falls back to 5:00 PM', () {
+      final due = ApiService.computeDueDate(afternoon, DateTime(2026, 7, 25, 9, 0));
+      expect(due, DateTime(2026, 7, 25, 17, 0));
+    });
+
+    test('a requested time equal to now falls back to 5:00 PM', () {
+      final due = ApiService.computeDueDate(afternoon, DateTime(2026, 7, 25, 14, 0));
+      expect(due, DateTime(2026, 7, 25, 17, 0));
+    });
+
+    test('a requested time still ahead is honoured', () {
+      final due = ApiService.computeDueDate(afternoon, DateTime(2026, 7, 25, 16, 30));
+      expect(due, DateTime(2026, 7, 25, 16, 30));
+    });
+  });
+
+  // Regression: registration dropped the Condition field, so every item was
+  // stored Available — a scope registered For Disposal was immediately
+  // borrowable (QA 2026-09-19, M1). addEquipment now maps through here.
+  group('Registration condition to starting status', () {
+    test('Good starts Available', () {
+      expect(ApiService.equipmentStatusForCondition('Good'), 'Available');
+    });
+    test('Fair starts Available', () {
+      expect(ApiService.equipmentStatusForCondition('Fair'), 'Available');
+    });
+    test('Under Repair does not start borrowable', () {
+      expect(ApiService.equipmentStatusForCondition('Under Repair'), 'Under Repair');
+    });
+    test('For Disposal does not start borrowable', () {
+      expect(ApiService.equipmentStatusForCondition('For Disposal'), 'For Disposal');
+    });
+  });
+
+  // Regression: the Reports screen counted Pending and Rejected requests as
+  // borrowings, and worked out "on time" without ever comparing a return date
+  // with a due date (QA 2026-09-19, M2).
+  group('Report metrics', () {
+    final now = DateTime(2026, 7, 27, 12, 0);
+
+    test('no transactions → all zero, and a 0% rate rather than a crash', () {
+      final m = ApiService.reportMetrics(const [], now: now);
+      expect(m['borrowings'], 0);
+      expect(m['returned'], 0);
+      expect(m['overdue'], 0);
+      expect(m['onTimeRate'], 0.0);
+      expect(m['mostBorrowed'], <String, int>{});
+    });
+
+    test('Pending and Rejected are not borrowings and cannot rank', () {
+      final m = ApiService.reportMetrics([
+        {'status': 'Approved', 'equipment_name': 'Theodolite', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Pending',  'equipment_name': 'Multimeter'},
+        {'status': 'Rejected', 'equipment_name': 'Multimeter'},
+        {'status': 'Rejected', 'equipment_name': 'Multimeter'},
+      ], now: now);
+      expect(m['borrowings'], 1);
+      // The rejected-only item used to place second in Most Borrowed.
+      expect(m['mostBorrowed'], {'Theodolite': 1});
+    });
+
+    test('on-time rate is measured against returns, not every request', () {
+      // One of two returns was late; two more requests never became loans. The
+      // old formula divided returns by all four and landed on 50% by accident.
+      final m = ApiService.reportMetrics([
+        {'status': 'Returned', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-20T16:00:00'},
+        {'status': 'Returned', 'due_date': '2026-07-21T17:00:00', 'return_date': '2026-07-22T09:00:00'},
+        {'status': 'Pending'},
+        {'status': 'Rejected'},
+      ], now: now);
+      expect(m['borrowings'], 2);
+      expect(m['returned'], 2);
+      expect(m['onTime'], 1);
+      expect(m['onTimeRate'], 50.0);
+    });
+
+    test('a return exactly on the deadline is on time', () {
+      final m = ApiService.reportMetrics([
+        {'status': 'Returned', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-20T17:00:00'},
+      ], now: now);
+      expect(m['onTimeRate'], 100.0);
+    });
+
+    test('a return with no recorded date is not held against the student', () {
+      final m = ApiService.reportMetrics([
+        {'status': 'Returned', 'due_date': '2026-07-20T17:00:00'},
+      ], now: now);
+      expect(m['onTime'], 1);
+    });
+
+    test('with no returns at all the rate is 0%, not a division by zero', () {
+      final m = ApiService.reportMetrics([
+        {'status': 'Approved', 'due_date': '2999-01-01T17:00:00'},
+      ], now: now);
+      expect(m['returned'], 0);
+      expect(m['onTimeRate'], 0.0);
+    });
+
+    test('overdue counts loans still out past their due date', () {
+      final m = ApiService.reportMetrics([
+        {'status': 'Approved', 'due_date': '2026-07-25T17:00:00'},
+        {'status': 'Approved', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Returned', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-21T09:00:00'},
+      ], now: now);
+      expect(m['overdue'], 1);
+      expect(m['borrowings'], 3);
+    });
+
+    test('Most Borrowed ranks by count and keeps the top four', () {
+      final m = ApiService.reportMetrics([
+        {'status': 'Returned', 'equipment_name': 'A', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-20T10:00:00'},
+        {'status': 'Returned', 'equipment_name': 'A', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-20T10:00:00'},
+        {'status': 'Returned', 'equipment_name': 'A', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-20T10:00:00'},
+        {'status': 'Approved', 'equipment_name': 'B', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Approved', 'equipment_name': 'B', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Approved', 'equipment_name': 'C', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Approved', 'equipment_name': 'D', 'due_date': '2999-01-01T17:00:00'},
+        {'status': 'Approved', 'equipment_name': 'E', 'due_date': '2999-01-01T17:00:00'},
+      ], now: now);
+      final ranked = m['mostBorrowed'] as Map<String, int>;
+      expect(ranked.length, 4);
+      expect(ranked.keys.first, 'A');
+      expect(ranked['A'], 3);
+      expect(ranked['B'], 2);
+    });
+  });
+
+  // Regression: the Home banner and Lab Policies both promised that overdue
+  // items stop you borrowing, but only a staff-placed hold blocked anything
+  // (QA 2026-09-19, M6). borrowEquipment now gates on this.
+  group('Overdue loans gate', () {
+    final now = DateTime(2026, 7, 27, 12, 0);
+
+    test('an approved loan past its due date is overdue', () {
+      final late = ApiService.overdueLoans([
+        {'status': 'Approved', 'equipment_name': 'Theodolite', 'due_date': '2026-07-25T17:00:00'},
+      ], now: now);
+      expect(late.length, 1);
+      expect(late.first['equipment_name'], 'Theodolite');
+    });
+
+    test('an approved loan not yet due is not overdue', () {
+      final late = ApiService.overdueLoans([
+        {'status': 'Approved', 'due_date': '2026-07-27T17:00:00'},
+      ], now: now);
+      expect(late, isEmpty);
+    });
+
+    test('returned, pending and rejected are never overdue', () {
+      final late = ApiService.overdueLoans([
+        {'status': 'Returned', 'due_date': '2026-07-20T17:00:00', 'return_date': '2026-07-22T09:00:00'},
+        {'status': 'Pending',  'due_date': '2026-07-20T17:00:00'},
+        {'status': 'Rejected', 'due_date': '2026-07-20T17:00:00'},
+      ], now: now);
+      expect(late, isEmpty);
+    });
+
+    test('a loan with no due date is not treated as overdue', () {
+      final late = ApiService.overdueLoans([
+        {'status': 'Approved'},
+      ], now: now);
+      expect(late, isEmpty);
+    });
+  });
+
+  // Made public 2026-09-21 so the student Home screen can age out alert cards
+  // without importing cloud_firestore. Firestore Timestamps are covered by the
+  // groups above, which run this through real transaction maps.
+  group('asDate', () {
+    test('parses an ISO string', () {
+      expect(ApiService.asDate('2026-07-20T17:00:00'),
+          DateTime(2026, 7, 20, 17, 0));
+    });
+    test('parses the space-separated form Firestore prints', () {
+      expect(ApiService.asDate('2026-07-20 17:00:00'),
+          DateTime(2026, 7, 20, 17, 0));
+    });
+    test('returns null for null', () {
+      expect(ApiService.asDate(null), isNull);
+    });
+    test('returns null for an unparseable value rather than throwing', () {
+      expect(ApiService.asDate('not a date'), isNull);
+      expect(ApiService.asDate(''), isNull);
+    });
+  });
+
   group('courseLabel', () {
     test('maps known program codes to full names', () {
       expect(courseLabel('CE'), 'Civil Engineering');
@@ -120,6 +324,21 @@ void main() {
     });
     test('falls back to the raw code for unknown values', () {
       expect(courseLabel('BSIT'), 'BSIT');
+    });
+  });
+
+  // Regression: studentId used to int.parse the Firebase UID, which is always
+  // alphanumeric, so it was always 0 and Edit Profile wrote to students/0.
+  group('Session.studentId', () {
+    tearDown(Session.clear);
+
+    test('is the Firebase UID exactly as stored', () {
+      Session.set({'student_id': 'aB3xY9kLmN0pQrStUvWx12345678'}, 'student');
+      expect(Session.studentId, 'aB3xY9kLmN0pQrStUvWx12345678');
+    });
+    test('is empty (not 0) when nobody is signed in', () {
+      Session.clear();
+      expect(Session.studentId, '');
     });
   });
 }

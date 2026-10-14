@@ -25,11 +25,11 @@ Architecture (CEA) Laboratory at New Era University.
 | App | Flutter (Dart) — Android |
 | Auth | Firebase Authentication (email/password + email verification) |
 | Database | Cloud Firestore (real-time listeners for requests/borrowings) |
-| Files | Firebase Storage (equipment photos) |
+| Files | Cloud Firestore `Blob`s (equipment photos — no Cloud Storage, stays on the free Spark plan) |
 | QR | `qr_flutter` (generation) + `mobile_scanner` (scanning) |
 
-Authorization is enforced **server-side** in `firestore.rules` /
-`storage.rules` (role-based: student, staff, admin, viewer; deny-by-default).
+Authorization is enforced **server-side** in `firestore.rules`
+(role-based: student, staff, admin, viewer; deny-by-default).
 See `BACKEND_SETUP.md` for deployment, account provisioning, and the demo-mode
 flag.
 
@@ -38,14 +38,27 @@ flag.
 ```
 lib/
   main.dart            entry point (Firebase init)
-  firstFile.dart       app code (services, session, all screens)
+  app.dart             root MaterialApp widget
+  theme.dart           colours, text styles, NeuLogo
+  constants.dart       courses, categories, statuses
   firebase_options.dart
+  services/            api_service.dart (Firestore access), session.dart, notif_prefs.dart
+  widgets/             common.dart (shared widgets)
+  screens/
+    auth/              splash, login, signup, legal
+    student/           home, catalog, detail, borrow, my borrowings, damage
+                       report, profile, edit profile, change password,
+                       notifications, lab policies, help & FAQ, about
+    staff/             dashboard, inventory, registration, requests, QR scan,
+                       damage reports, penalties, students, student detail, reports
 firestore.rules        Firestore security rules   ← deploy these
-storage.rules          Storage security rules     ← deploy these
 BACKEND_SETUP.md       backend setup + roles + demo mode
 test/                  unit + widget tests (flutter test)
 load_test.js           Firestore load/stress probe (node load_test.js)
 ```
+
+Photos are stored in Cloud Firestore, not Cloud Storage, so the project stays on
+the free Spark plan and there is no `storage.rules` to deploy.
 
 ## Running
 
@@ -55,5 +68,7 @@ flutter run          # device/emulator with Google Play services
 flutter test         # unit + widget tests, no Firebase needed
 ```
 
-> ⚠️ `kDemoMode` in `lib/firstFile.dart` relaxes sign-up (any email, no
-> verification) for demos. Set it to `false` for production builds.
+> `kDemoMode` in `lib/services/api_service.dart` is now **`false`** — sign-up
+> requires an `@neu.edu.ph` address and a confirmed verification email. Accounts
+> created before `kLegacyAccountCutoff` (2026-08-03) skip the verification gate,
+> so the existing demo accounts still sign in.

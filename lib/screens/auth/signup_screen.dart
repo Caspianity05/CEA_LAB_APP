@@ -102,7 +102,10 @@ class _SignUpScreenState extends State<SignUpScreen> {
           'student_number': _studentIdCtrl.text.trim(),
           'course':         _selectedCourse ?? '',
           'year_level':     int.tryParse(_yearCtrl.text.trim()) ?? 1,
-          'password':       _passCtrl.text,
+          // Trimmed to match login, which has always trimmed. A password with
+          // a trailing space could be created and then never signed in with
+          // (QA 2026-09-19, low #10).
+          'password':       _passCtrl.text.trim(),
         });
         if (!mounted) return;
         Navigator.pop(context); // close loading
@@ -135,8 +138,19 @@ class _SignUpScreenState extends State<SignUpScreen> {
             SnackBar(content: Text(res['message'] ?? 'Registration failed.'), backgroundColor: AppTheme.danger));
         }
       } catch (e) {
+        // This pop was unguarded: if the throw happened AFTER the loading
+        // dialog was already closed, it popped the sign-up screen itself and
+        // the user was thrown back to login mid-error. Only close what is
+        // actually still up.
+        //
+        // NOTE: QA 2026-09-19 low #12 also reports "every sign-up error prints
+        // twice". That was NOT reproduced here — registerStudent returns a
+        // result map rather than throwing, so this catch does not run on an
+        // ordinary failure. Left open; it needs a repro first.
         if (mounted) {
-          Navigator.pop(context);
+          if (Navigator.canPop(context)) {
+            Navigator.pop(context);
+          }
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Could not create the account. Check your internet connection and try again.'), backgroundColor: AppTheme.danger));
         }

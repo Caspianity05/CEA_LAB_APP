@@ -94,19 +94,57 @@ class ApiService {
   }
 
   // ── Auth ──────────────────────────────────────────────────────────────────
+
+  // The e-mail verification gate, shared by login() and the splash screen's
+  // session restore so the two can never disagree. True when the signed-in
+  // user may proceed: demo mode, an admin/viewer staff account (provisioned by
+  // an administrator), an account predating kLegacyAccountCutoff, or a
+  // verified e-mail address.
+  static bool passesVerificationGate(Map<String, dynamic>? profile,
+      {bool isStaff = false}) {
+    if (kDemoMode) return true;
+    if (isStaff) {
+      final sRole = (profile?['role'] ?? 'staff').toString();
+      if (sRole == 'admin' || sRole == 'viewer') return true;
+    }
+    if (_isLegacyAccount(profile)) return true;
+    return _auth.currentUser?.emailVerified == true;
+  }
+
+  // A failed login must never leave anyone signed in. Sign-in can succeed
+  // before a later step fails — e.g. a student account used on the Lab Staff
+  // tab — and the splash screen restores whatever session is left behind on
+  // the next launch, which used to skip the verification gate entirely
+  // (QA 2026-09-19, H3).
+  static Future<void> _signOutQuietly() async {
+    try {
+      if (_auth.currentUser != null) await _auth.signOut();
+    } catch (_) {}
+  }
+
   static Future<Map<String, dynamic>> login(
       String identifier, String password, String role) async {
     try {
       if (role == 'student') {
-        // Students sign in with their student number. Resolve it to an email via
-        // the public lookup index — this works BEFORE authentication, unlike a
-        // query on the protected `students` collection (see firestore.rules).
-        final lookup =
-            await _db.collection('student_lookup').doc(identifier).get();
-        if (!lookup.exists) {
-          return {'success': false, 'message': 'Student ID not found.'};
+        // The field is labelled "Student ID / Email", so both have to work. An
+        // address used to be sent to the lookup index and bounce with "Student
+        // ID not found." (QA 2026-09-19, M7); anything containing '@' is now
+        // taken as the e-mail itself and skips the lookup.
+        String email;
+        if (identifier.contains('@')) {
+          email = identifier;
+        } else {
+          // Students sign in with their student number. Resolve it to an email
+          // via the public lookup index — this works BEFORE authentication,
+          // unlike a query on the protected `students` collection (see
+          // firestore.rules).
+          final lookup =
+              await _db.collection('student_lookup').doc(identifier).get();
+          if (!lookup.exists) {
+            return {'success': false, 'message': 'Student ID not found.'};
+          }
+          email = lookup.data()!['email'] as String;
         }
-        final email = lookup.data()!['email'] as String;
         await _auth.signInWithEmailAndPassword(email: email, password: password);
         final uid = _auth.currentUser!.uid;
         // Profile is read BEFORE the verification gate: the grandfather check
@@ -116,9 +154,7 @@ class ApiService {
           await _auth.signOut();
           return {'success': false, 'message': 'Student profile not found.'};
         }
-        if (!kDemoMode &&
-            !_isLegacyAccount(doc.data()) &&
-            _auth.currentUser?.emailVerified != true) {
+        if (!passesVerificationGate(doc.data())) {
           await _auth.signOut();
           return {'success': false, 'message': 'email_not_verified', 'email': email};
         }
@@ -135,11 +171,21 @@ class ApiService {
         Map<String, dynamic> staffData;
         String staffDocId;
         if (!snap.exists) {
-          final q = await _db
-              .collection('staff')
-              .where('email', isEqualTo: identifier)
-              .limit(1)
-              .get();
+          final QuerySnapshot<Map<String, dynamic>> q;
+          try {
+            q = await _db
+                .collection('staff')
+                .where('email', isEqualTo: identifier)
+                .limit(1)
+                .get();
+          } on FirebaseException catch (e) {
+            // Only staff may query this collection, so a non-staff account
+            // (e.g. a student on the Lab Staff tab) is refused here rather
+            // than finding no match. Say so plainly instead of "permission".
+            if (e.code != 'permission-denied') rethrow;
+            await _auth.signOut();
+            return {'success': false, 'message': 'Staff account not found.'};
+          }
           if (q.docs.isEmpty) {
             await _auth.signOut();
             return {'success': false, 'message': 'Staff account not found.'};
@@ -154,10 +200,7 @@ class ApiService {
         // Admin / viewer accounts are provisioned by an administrator and skip
         // the email-verification gate; regular staff must still verify, unless
         // the account predates the closing of demo mode (see kLegacyAccountCutoff).
-        final sRole = (staffData['role'] ?? 'staff').toString();
-        if (!kDemoMode && sRole != 'admin' && sRole != 'viewer' &&
-            !_isLegacyAccount(staffData) &&
-            _auth.currentUser?.emailVerified != true) {
+        if (!passesVerificationGate(staffData, isStaff: true)) {
           await _auth.signOut();
           return {'success': false, 'message': 'email_not_verified', 'email': identifier};
         }
@@ -165,6 +208,7 @@ class ApiService {
         return {'success': true, 'role': 'staff', 'user': {...staffData, 'staff_id': staffDocId}};
       }
     } on FirebaseAuthException catch (e) {
+      await _signOutQuietly();
       String msg = 'Login failed.';
       if (e.code == 'wrong-password' || e.code == 'invalid-credential')
         msg = 'Incorrect password.';
@@ -172,6 +216,43 @@ class ApiService {
       else if (e.code == 'too-many-requests')
         msg = 'Too many attempts. Try again later.';
       return {'success': false, 'message': msg};
+    } catch (e) {
+      await _signOutQuietly();
+      return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // Change the signed-in user's password. Firebase only accepts a password
+  // change shortly after a sign-in, so re-authenticate with the current
+  // password first — which is also the "current password is correct" check
+  // the screen promises. (Until 2026-09-19 the screen only waited 700 ms and
+  // showed a success dialog; nothing was ever changed — QA H1.)
+  static Future<Map<String, dynamic>> changePassword(
+      String currentPassword, String newPassword) async {
+    final user  = _auth.currentUser;
+    final email = user?.email;
+    if (user == null || email == null) {
+      return {'success': false, 'message': 'Your session has expired. Please sign in again.'};
+    }
+    try {
+      await user.reauthenticateWithCredential(
+          EmailAuthProvider.credential(email: email, password: currentPassword));
+      await user.updatePassword(newPassword);
+      return {'success': true, 'message': 'Password changed.'};
+    } on FirebaseAuthException catch (e) {
+      switch (e.code) {
+        case 'wrong-password':
+        case 'invalid-credential':
+          return {'success': false, 'message': 'Current password is incorrect.'};
+        case 'weak-password':
+          return {'success': false, 'message': 'New password is too weak.'};
+        case 'too-many-requests':
+          return {'success': false, 'message': 'Too many attempts. Try again later.'};
+        case 'requires-recent-login':
+          return {'success': false, 'message': 'Please sign out, sign in again, then retry.'};
+        default:
+          return {'success': false, 'message': e.message ?? 'Could not change password.'};
+      }
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
     }
@@ -322,6 +403,24 @@ class ApiService {
     }
   }
 
+  // End the session properly.
+  //
+  // `Session.clear()` on its own only drops the in-memory user — it leaves
+  // `FirebaseAuth.instance.currentUser` set, and the splash screen restores
+  // that on the next launch whenever "Remember me" is on (which is the
+  // default). Signing out and relaunching would therefore drop straight back
+  // into the account that just signed out — including a staff ADMIN account on
+  // a shared lab phone. Always go through here.
+  static Future<void> signOut() async {
+    try {
+      await _auth.signOut();
+    } catch (_) {
+      // Even if the network call fails, drop the local session so the UI
+      // cannot keep acting as the signed-in user.
+    }
+    Session.clear();
+  }
+
   // ── Equipment ─────────────────────────────────────────────────────────────
   static Future<List<dynamic>> getEquipment(
       {String search = '', String category = ''}) async {
@@ -381,12 +480,23 @@ class ApiService {
   // the number, billed per ~1000 documents scanned rather than per document
   // read. This keeps the summary accurate over the whole inventory while the
   // list below it is paginated.
-  static Future<({int total, int available})> getEquipmentCounts() async {
+  // `borrowed` is counted on its own rather than inferred as "everything that
+  // is not Available": the Inventory header used to show total − available
+  // under a "Borrowed" label, which silently folded in Under Repair and For
+  // Disposal items and read 6 when 3 things were out (QA 2026-09-19, low #6).
+  static Future<({int total, int available, int borrowed})>
+      getEquipmentCounts() async {
     final col = _db.collection('equipment');
     final totalSnap = await col.count().get();
     final availSnap =
         await col.where('status', isEqualTo: 'Available').count().get();
-    return (total: totalSnap.count ?? 0, available: availSnap.count ?? 0);
+    final borrowSnap =
+        await col.where('status', isEqualTo: 'Borrowed').count().get();
+    return (
+      total:     totalSnap.count ?? 0,
+      available: availSnap.count ?? 0,
+      borrowed:  borrowSnap.count ?? 0,
+    );
   }
 
   static Future<Map<String, dynamic>> getEquipmentByQr(String qrCode) async {
@@ -418,12 +528,23 @@ class ApiService {
           : category.toUpperCase();
       final suffix  = DateTime.now().millisecondsSinceEpoch.toString().substring(7);
       final qrCode  = provided.isNotEmpty ? provided : '$prefix-$suffix';
+      // The condition chosen at registration decides the starting status, so an
+      // item registered as Under Repair / For Disposal is not immediately
+      // borrowable (QA 2026-09-19, M1 — this used to be hard-coded Available).
+      // 'Borrowed' is never a valid starting status: a brand-new item is not on
+      // loan, so anything unrecognised falls back to Available.
+      final condition = (data['condition'] as String?)?.trim() ?? '';
+      final requested = (data['status'] as String?)?.trim() ?? '';
+      final status = kStatuses.contains(requested) && requested != 'Borrowed'
+          ? requested
+          : equipmentStatusForCondition(condition);
       final ref = await _db.collection('equipment').add({
         'equipment_name': name,
         'category':       category,
         'location':       location,
         'qr_code':        qrCode,
-        'status':         'Available',
+        'status':         status,
+        if (condition.isNotEmpty) 'condition': condition,
         'courses':        (data['courses'] as List?)?.cast<String>() ?? [],
         'description':    data['description'] ?? '',
         'brand':          data['brand'] ?? '',
@@ -438,6 +559,7 @@ class ApiService {
         'message':      'Equipment added successfully.',
         'equipment_id': ref.id,
         'qr_code':      qrCode,
+        'status':       status,
       };
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
@@ -447,6 +569,31 @@ class ApiService {
   static Future<Map<String, dynamic>> updateEquipment(
       String equipmentId, Map<String, dynamic> data) async {
     try {
+      // An item that is out on an approved loan has to stay 'Borrowed'.
+      // Setting it back to Available let staff approve a SECOND loan for the
+      // same physical unit; the QR return then found two active loans and
+      // refused to complete either, stranding both (QA 2026-09-19, M5).
+      final status = data['status'] as String?;
+      if (status != null && status != 'Borrowed') {
+        // Single-field query (no composite index needed); filter in Dart.
+        final snap = await _db
+            .collection('borrow_transactions')
+            .where('equipment_id', isEqualTo: equipmentId)
+            .get();
+        final active = snap.docs
+            .where((d) => (d.data())['status'] == 'Approved')
+            .toList();
+        if (active.isNotEmpty) {
+          final who = '${active.first.data()['borrower_name'] ?? ''}'.trim();
+          return {
+            'success': false,
+            'on_loan': true,
+            'message': 'This item is still out on loan'
+                '${who.isEmpty ? '' : ' to $who'}. Mark it as returned from '
+                'the Dashboard before changing its status.',
+          };
+        }
+      }
       await _db.collection('equipment').doc(equipmentId).update(data);
       return {'success': true};
     } catch (e) {
@@ -571,6 +718,36 @@ class ApiService {
         };
       }
 
+      // ── Overdue gate (QA 2026-09-19, M6) ──
+      // The Home banner ("…before borrowing again") and the Lab Policies screen
+      // ("Late returns lose borrowing privileges") both promise this, but until
+      // now only a staff-placed hold blocked anything, so a student could sit
+      // on two overdue items and keep borrowing. Holding an item past its due
+      // date now closes new loans until it is back.
+      if (sid.isNotEmpty) {
+        final mine = await _db
+            .collection('borrow_transactions')
+            .where('student_id', isEqualTo: sid)
+            .get();
+        final late = overdueLoans(mine.docs.map((d) => d.data()).toList());
+        if (late.isNotEmpty) {
+          final names =
+              late.map((t) => '${t['equipment_name'] ?? 'an item'}').toSet();
+          final listed = names.take(3).join(', ');
+          final one = late.length == 1;
+          return {
+            'success': false,
+            'overdue': true,
+            'overdue_count': late.length,
+            'message': 'You have ${late.length} overdue '
+                '${one ? 'item' : 'items'} ($listed'
+                '${names.length > 3 ? ', …' : ''}). Please return '
+                '${one ? 'it' : 'them'} to the laboratory before borrowing '
+                'again.',
+          };
+        }
+      }
+
       // Check equipment is Available
       final eqDoc = await _db.collection('equipment').doc(equipId).get();
       if (!eqDoc.exists) {
@@ -584,28 +761,44 @@ class ApiService {
         };
       }
 
-      // ── Program / course restriction (Prof recommendation #1) ──
-      // Equipment can be tagged with the programs allowed to borrow it. An empty
-      // or absent list means the item is open to every program. Otherwise, a
-      // student may only borrow it if their program is in the allowed list. This
-      // is the authoritative gate — the catalog also hides restricted items, but
-      // this stops a borrow even if the item is reached some other way.
-      final allowedCourses =
-          (eqData['courses'] as List?)?.map((c) => '$c').toList() ?? [];
-      if (allowedCourses.isNotEmpty) {
-        final studentCourse =
-            '${stuData?['course'] ?? data['course'] ?? ''}';
-        if (!allowedCourses.contains(studentCourse)) {
+      // ── One pending request per item per student (QA 2026-09-19, low #3) ──
+      // Tapping Submit twice, or coming back to the form later, used to file a
+      // second Pending row for the same item. Staff then saw the same student
+      // queued twice for one physical unit, and approving both is exactly the
+      // double-loan that strands an item (see M5). A student cannot withdraw a
+      // request themselves — the rules only let staff update a transaction —
+      // so the duplicate had to be rejected by hand.
+      if (sid.isNotEmpty) {
+        // Single-field query (no composite index needed); filter in Dart —
+        // the same shape the rest of this file uses.
+        final dupes = await _db
+            .collection('borrow_transactions')
+            .where('student_id', isEqualTo: sid)
+            .get();
+        final pending = dupes.docs.where((d) =>
+            d.data()['status'] == 'Pending' &&
+            '${d.data()['equipment_id']}' == equipId);
+        if (pending.isNotEmpty) {
           return {
             'success': false,
-            'course_restricted': true,
-            'message': 'This equipment is reserved for '
-                '${allowedCourses.map((c) => courseLabel(c)).join(', ')} '
-                'students and is not available to your program'
-                '${studentCourse.isNotEmpty ? ' (${courseLabel(studentCourse)})' : ''}.',
+            'duplicate': true,
+            'message': 'You already have a pending request for '
+                '${eqData['equipment_name'] ?? 'this item'}. Please wait for '
+                'laboratory staff to act on it.',
           };
         }
       }
+
+      // NOTE (2026-09-20): the program/course restriction that used to sit here
+      // was removed by decision — any student may borrow any item. The
+      // `courses` field is kept and still shown (catalog badge, Equipment
+      // Detail, the staff registration picker), but it is advisory now: it says
+      // which programs an item is intended for, and no longer gates a borrow.
+      // The catalog's "My program only / Show all" chip is likewise only a
+      // convenience filter, which is all it ever was.
+      //
+      // This also closes QA probe P06 — a student editing their own course can
+      // no longer reach anything they could not reach already.
 
       // Honour the student's requested return time, enforcing the same-day
       // 5:00 PM laboratory policy as the latest possible deadline.
@@ -623,8 +816,13 @@ class ApiService {
         // as it looked when borrowed. ~8 KB.
         if (eqData['photo_thumb'] != null) 'photo_thumb': eqData['photo_thumb'],
         'category':       eqData['category'] ?? '',
-        'borrower_name':  data['borrower_name'] ?? '',
-        'student_number': data['student_number'] ?? '',
+        // Identity comes from the student's own profile, never from form
+        // input: staff read these on every request, penalty and hold screen,
+        // and a typed-in name/ID let a student file under a forged identity
+        // (QA 2026-09-19, H5). The form values are only a fallback for a
+        // profile that could not be read.
+        'borrower_name':  stuData?['name'] ?? data['borrower_name'] ?? '',
+        'student_number': stuData?['student_number'] ?? data['student_number'] ?? '',
         'subject':        data['subject'] ?? '',
         'quantity':       data['quantity'] ?? 1,
         'purpose':        data['purpose'] ?? '',
@@ -646,18 +844,26 @@ class ApiService {
   // Same-day 5:00 PM due-date policy: a requested time at or before 17:00 is
   // honoured (on today's date); anything later — or no request — clamps to
   // 17:00. Public and pure so the policy is unit-testable (see test/).
+  //
+  // A requested time that has already passed is not a deadline at all, so it
+  // falls back to the 17:00 default instead of being stored as-is. The form
+  // refuses one up front with a clear message; this is the backstop that keeps
+  // a loan from being overdue the instant it is approved (QA 2026-09-19, M3).
   static DateTime computeDueDate(DateTime now, DateTime? requested) {
     if (requested != null &&
         !(requested.hour > 17 ||
             (requested.hour == 17 && requested.minute > 0))) {
-      return DateTime(
+      final sameDay = DateTime(
           now.year, now.month, now.day, requested.hour, requested.minute, 0);
+      if (sameDay.isAfter(now)) return sameDay;
     }
     return DateTime(now.year, now.month, now.day, 17, 0, 0);
   }
 
-  // Equipment status to set when an item is returned in a given condition.
-  // Public and pure so the mapping is unit-testable (see test/).
+  // Equipment status for a given condition. Used both when an item is returned
+  // and when one is registered, so a "For Disposal" item is never borrowable
+  // whichever door it came through. Public and pure so the mapping is
+  // unit-testable (see test/).
   static String equipmentStatusForCondition(String condition) {
     switch (condition) {
       case 'Damaged':
@@ -684,6 +890,16 @@ class ApiService {
         final data = txDoc.data() as Map<String, dynamic>;
         if (data['status'] == 'Returned') {
           return {'success': false, 'message': 'This item was already returned.'};
+        }
+        // Only an active loan can be returned. A stale list could otherwise
+        // "return" a request that was rejected meanwhile, freeing an item
+        // that is out on someone else's loan.
+        if (data['status'] != 'Approved') {
+          return {
+            'success': false,
+            'message': 'This request is ${data['status'] ?? 'unknown'}, not an '
+                'active loan. Refresh to see the latest.'
+          };
         }
         final equipId = data['equipment_id'] as String;
         tx.update(txRef, {
@@ -729,8 +945,10 @@ class ApiService {
         // Approved loans. Surface it instead of silently returning one.
         return {
           'success': false,
-          'message': 'Multiple active loans found for this equipment. '
-              'Please resolve them from the Requests screen.',
+          // The Requests screen has no return action — only the Dashboard's
+          // Active Loans list does (QA 2026-09-19, M5).
+          'message': 'Multiple active loans found for this equipment. Please '
+              'return them one at a time from the Dashboard\'s Active Loans.',
         };
       }
       final activeDoc = active.first;
@@ -819,11 +1037,7 @@ class ApiService {
     final equipF    = getEquipmentCounts();
     final pendingF  = getRequests(status: 'Pending');
     final approvedF = getRequests(status: 'Approved');
-    final damageF   = _db
-        .collection('damage_reports')
-        .where('status', isEqualTo: 'Open')
-        .count()
-        .get();
+    final damageF   = openDamageReportCount();
     final studentsF = _db.collection('students').count().get();
     final heldF     = _db
         .collection('students')
@@ -851,7 +1065,7 @@ class ApiService {
         'overdue_loans':       overdue,
         'total_equipment':     equip.total,
         'available_equipment': equip.available,
-        'damage_reports':      damage.count ?? 0,
+        'damage_reports':      damage,
         'total_students':      students.count ?? 0,
         'held_students':       held.count ?? 0,
       },
@@ -909,8 +1123,29 @@ class ApiService {
         if (!txDoc.exists) {
           return {'success': false, 'message': 'Transaction not found.'};
         }
-        final equipId =
-            (txDoc.data() as Map<String, dynamic>)['equipment_id'] as String;
+        final txData = txDoc.data() as Map<String, dynamic>;
+
+        // Only a request that is still Pending can be decided. Staff lists can
+        // be stale (the Dashboard's is a one-shot read), and without this a
+        // second phone could Deny a request another staff member had already
+        // approved — the loan became Rejected while the item stayed Borrowed
+        // with no loan behind it (QA 2026-09-19, H4).
+        final current = (txData['status'] ?? '').toString();
+        if (current != 'Pending') {
+          final by = current == 'Approved'
+              ? '${txData['approved_by_name'] ?? ''}'
+              : current == 'Rejected'
+                  ? '${txData['rejected_by_name'] ?? ''}'
+                  : '';
+          return {
+            'success': false,
+            'already_decided': true,
+            'message': 'This request was already ${current.toLowerCase()}'
+                '${by.isNotEmpty ? ' by $by' : ''}.',
+          };
+        }
+
+        final equipId = txData['equipment_id'] as String;
         final eqRef = _db.collection('equipment').doc(equipId);
 
         if (action == 'approve') {
@@ -995,15 +1230,31 @@ class ApiService {
     return results;
   }
 
-  // Number of damage reports still needing attention (status == Open).
-  // Counted server-side rather than by reading every damage report.
+  // Number of damage reports still needing attention.
+  //
+  // Counted as everything minus the two triaged states, NOT as
+  // `where('status', isEqualTo: 'Open')`. A Firestore equality filter cannot
+  // match a document that has no `status` field at all, and reports created
+  // before triage started stamping `status: 'Open'` have none — so the old
+  // query returned 0 while the Damage Reports screen listed those same reports
+  // as "Open" (it defaults a missing status to Open, as does the filter in
+  // getDamageReports). The dashboard and the list disagreed on live data.
+  //
+  // Subtracting is what matches the UI: `whereNotIn` would not work either,
+  // because a missing field never satisfies an inequality. The triage
+  // vocabulary is closed — Open / Reviewed / Resolved — so this is exact.
+  // Still counted server-side; three aggregations are billed per ~1000
+  // documents scanned, not per document read.
   static Future<int> openDamageReportCount() async {
-    final snap = await _db
-        .collection('damage_reports')
-        .where('status', isEqualTo: 'Open')
-        .count()
-        .get();
-    return snap.count ?? 0;
+    final col = _db.collection('damage_reports');
+    final totalF    = col.count().get();
+    final resolvedF = col.where('status', isEqualTo: 'Resolved').count().get();
+    final reviewedF = col.where('status', isEqualTo: 'Reviewed').count().get();
+    final total    = (await totalF).count ?? 0;
+    final resolved = (await resolvedF).count ?? 0;
+    final reviewed = (await reviewedF).count ?? 0;
+    final open = total - resolved - reviewed;
+    return open < 0 ? 0 : open;
   }
 
   // Update a damage report's triage status (Open → Reviewed / Resolved) and
@@ -1093,7 +1344,9 @@ class ApiService {
 
   // Parse a transaction date field that may be an ISO string (borrow/due, as
   // mapped) or a raw Firestore Timestamp (return_date isn't pre-converted).
-  static DateTime? _asDate(dynamic v) {
+  // Public because the student Home screen needs the same parsing to work out
+  // how old an alert card is, and screens do not import cloud_firestore.
+  static DateTime? asDate(dynamic v) {
     if (v == null) return null;
     if (v is Timestamp) return v.toDate();
     return DateTime.tryParse('$v'.replaceAll(' ', 'T'));
@@ -1110,13 +1363,14 @@ class ApiService {
   static Map<String, dynamic> studentReliability(List<dynamic> txns,
       {DateTime? now}) {
     final ref = now ?? DateTime.now();
-    var loans = 0, late = 0, overdue = 0, damages = 0;
+    var loans = 0, late = 0, overdue = 0, damages = 0, active = 0;
     for (final t in txns) {
       final status = '${t['status'] ?? ''}';
-      final due = _asDate(t['due_date']);
+      final due = asDate(t['due_date']);
       if (status == 'Approved' || status == 'Returned') loans++;
+      if (status == 'Approved') active++;
       if (status == 'Returned') {
-        final ret = _asDate(t['return_date']);
+        final ret = asDate(t['return_date']);
         if (due != null && ret != null && ret.isAfter(due)) late++;
         final cond = '${t['condition_returned'] ?? ''}';
         if (cond == 'Damaged' ||
@@ -1132,6 +1386,7 @@ class ApiService {
     final rating = flags == 0 ? 'Good' : (flags <= 2 ? 'Fair' : 'Watch');
     return {
       'loans': loans,
+      'active': active,
       'late': late,
       'overdue': overdue,
       'damages': damages,
@@ -1139,15 +1394,78 @@ class ApiService {
     };
   }
 
+  // Aggregates a reporting period's transactions into the numbers the staff
+  // Reports screen shows. Pure (takes an optional [now]) so the arithmetic is
+  // unit-testable (see test/).
+  //
+  // What counts as a borrowing is the whole point here, and it used to be wrong
+  // (QA 2026-09-19, M2):
+  //   • borrowings   — Approved or Returned only. A Pending request is not a
+  //     loan yet and a Rejected one never became one, so neither is counted and
+  //     neither can rank in Most Borrowed. (A rejected-only item used to place
+  //     second.) Same definition as studentReliability's `loans`.
+  //   • onTimeRate   — returns made on or before the due date, over the number
+  //     of RETURNS. The old formula was returns ÷ every request and never once
+  //     compared a return date with a due date, so it sank when a request was
+  //     filed and rose when one was rejected.
+  //   • overdue      — still out (Approved) and past due right now.
+  static Map<String, dynamic> reportMetrics(List<dynamic> txns,
+      {DateTime? now}) {
+    final ref = now ?? DateTime.now();
+    var borrowings = 0, returned = 0, onTime = 0, overdue = 0;
+    final Map<String, int> perItem = {};
+    for (final t in txns) {
+      final status = '${t['status'] ?? ''}';
+      if (status != 'Approved' && status != 'Returned') continue;
+      borrowings++;
+      final name = '${t['equipment_name'] ?? 'Unknown'}';
+      perItem[name] = (perItem[name] ?? 0) + 1;
+      final due = asDate(t['due_date']);
+      if (status == 'Returned') {
+        returned++;
+        final ret = asDate(t['return_date']);
+        // A return with no recorded date cannot be shown to be late, so it is
+        // not held against the student.
+        if (due == null || ret == null || !ret.isAfter(due)) onTime++;
+      } else if (due != null && due.isBefore(ref)) {
+        overdue++;
+      }
+    }
+    final sorted = perItem.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return {
+      'borrowings':   borrowings,
+      'returned':     returned,
+      'onTime':       onTime,
+      'overdue':      overdue,
+      'onTimeRate':   returned > 0 ? onTime / returned * 100 : 0.0,
+      'mostBorrowed': Map<String, int>.fromEntries(sorted.take(4)),
+    };
+  }
+
+  // Loans a student still has out past their due date. Pure so the overdue
+  // borrowing gate can be unit-tested (see test/ and borrowEquipment).
+  static List<dynamic> overdueLoans(List<dynamic> txns, {DateTime? now}) {
+    final ref = now ?? DateTime.now();
+    return txns.where((t) {
+      if ('${t['status'] ?? ''}' != 'Approved') return false;
+      final due = asDate(t['due_date']);
+      return due != null && due.isBefore(ref);
+    }).toList();
+  }
+
   // ── Update Profile ────────────────────────────────────────────────────────
   static Future<Map<String, dynamic>> updateProfile({
-    required dynamic studentId,
+    required String studentId,
     required String name,
     required String course,
     required int yearLevel,
   }) async {
+    if (studentId.isEmpty) {
+      return {'success': false, 'message': 'Your session has expired. Please sign in again.'};
+    }
     try {
-      await _db.collection('students').doc('$studentId').update({
+      await _db.collection('students').doc(studentId).update({
         'name':       name,
         'course':     course,
         'year_level': yearLevel,
