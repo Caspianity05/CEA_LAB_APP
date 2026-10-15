@@ -18,7 +18,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # of the product and file versions while build-number is used as the build suffix.
 # Keep in step with kAppVersion / kAppBuild in lib/constants.dart — the About
 # screen prints those, and they are how you tell two installed builds apart.
-version: 1.0.5+6
+version: 1.0.9+10
 
 environment:
   sdk: ^3.11.1
