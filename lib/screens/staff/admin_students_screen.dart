@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import '../../constants.dart';
 import '../../services/api_service.dart';
+import '../../services/session.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
 import 'admin_student_detail_screen.dart';
@@ -131,7 +132,7 @@ class _AdminStudentsScreenState extends State<AdminStudentsScreen> {
         leading: CircleAvatar(
           radius: 22,
           backgroundColor: const Color(0x141B3A8C),
-          child: Text(_initials(name),
+          child: Text(Session.initialsOf(name),
               style: const TextStyle(color: AppTheme.primary, fontWeight: FontWeight.bold)),
         ),
         title: Text(name,
@@ -143,13 +144,6 @@ class _AdminStudentsScreenState extends State<AdminStudentsScreen> {
             : const Icon(Icons.arrow_forward_ios_rounded, size: 14, color: AppTheme.textLight),
       ),
     );
-  }
-
-  String _initials(String name) {
-    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
-    if (parts.isEmpty) return '?';
-    if (parts.length == 1) return parts[0][0].toUpperCase();
-    return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
   }
 }
 

@@ -97,15 +97,15 @@ class ApiService {
 
   // The e-mail verification gate, shared by login() and the splash screen's
   // session restore so the two can never disagree. True when the signed-in
-  // user may proceed: demo mode, an admin/viewer staff account (provisioned by
-  // an administrator), an account predating kLegacyAccountCutoff, or a
-  // verified e-mail address.
+  // user may proceed: demo mode, a superadmin/admin/viewer staff account
+  // (provisioned by an administrator — kProvisionedStaffRoles), an account
+  // predating kLegacyAccountCutoff, or a verified e-mail address.
   static bool passesVerificationGate(Map<String, dynamic>? profile,
       {bool isStaff = false}) {
     if (kDemoMode) return true;
     if (isStaff) {
       final sRole = (profile?['role'] ?? 'staff').toString();
-      if (sRole == 'admin' || sRole == 'viewer') return true;
+      if (kProvisionedStaffRoles.contains(sRole)) return true;
     }
     if (_isLegacyAccount(profile)) return true;
     return _auth.currentUser?.emailVerified == true;
@@ -1471,6 +1471,102 @@ class ApiService {
         'year_level': yearLevel,
       });
       return {'success': true, 'message': 'Profile updated successfully.'};
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // The staff side's one self-service write. `staff/{uid}` is otherwise closed
+  // to the client (firestore.rules), so this changes the display name and
+  // nothing else: role and email stay with whoever provisioned the account.
+  //
+  // `staffId` is the staff DOCUMENT id, which is normally the caller's Auth
+  // UID. Login has a legacy fallback that finds the doc by its `email` field
+  // when the id is something else (api_service.dart, login → staff branch);
+  // for such an account the rules refuse the write, because the uid does not
+  // match the document. Say so plainly rather than "permission denied".
+  static Future<Map<String, dynamic>> updateStaffName({
+    required String staffId,
+    required String name,
+  }) async {
+    if (staffId.isEmpty) {
+      return {'success': false, 'message': 'Your session has expired. Please sign in again.'};
+    }
+    try {
+      await _db.collection('staff').doc(staffId).update({'name': name});
+      return {'success': true, 'message': 'Profile updated successfully.'};
+    } on FirebaseException catch (e) {
+      if (e.code == 'permission-denied') {
+        return {
+          'success': false,
+          'message': 'This staff account cannot be renamed from the app. '
+              'Ask an administrator to change it.',
+        };
+      }
+      return {'success': false, 'message': friendlyError(e)};
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // The staff directory behind the superadmin's Staff Accounts screen. Any
+  // staff member may read this collection (firestore.rules), so the read is not
+  // gated here — the screen that opens it is.
+  static Future<List<Map<String, dynamic>>> getStaffList() async {
+    final snap = await _db.collection('staff').get();
+    final list = snap.docs.map((d) => {...d.data(), 'staff_id': d.id}).toList();
+    list.sort((a, b) =>
+        '${a['name']}'.toLowerCase().compareTo('${b['name']}'.toLowerCase()));
+    return list;
+  }
+
+  // The signed-in staff member's own document, live, for the staff portal to
+  // follow access-level changes (QA 2026-09-23, F2). The rules let an account
+  // read its own staff document whatever its level, so this stays readable
+  // for as long as the session lasts. Null means the server confirmed the
+  // document is gone; a "missing" served from the offline cache proves
+  // nothing, so it is skipped rather than reported.
+  static Stream<Map<String, dynamic>?> staffSelfStream(String staffId) => _db
+      .collection('staff')
+      .doc(staffId)
+      .snapshots()
+      .where((s) => s.exists || !s.metadata.isFromCache)
+      .map((s) => s.exists ? s.data() : null);
+
+  // A superadmin editing ANOTHER staff member: display name, access level, or
+  // both. The rules refuse it for everyone else, and refuse it on your own
+  // document — a superadmin cannot change its own role, which is what stops the
+  // last one demoting itself and leaving the system with no senior account.
+  static Future<Map<String, dynamic>> updateStaffMember({
+    required String staffId,
+    String? name,
+    String? role,
+  }) async {
+    if (staffId.isEmpty) {
+      return {'success': false, 'message': 'That staff account is missing an id.'};
+    }
+    if (staffId == Session.staffId) {
+      return {
+        'success': false,
+        'message': 'Change your own name in My Profile. Your own access level '
+            'can only be changed by another super admin.',
+      };
+    }
+    final patch = <String, dynamic>{};
+    if (name != null) patch['name'] = name;
+    if (role != null) patch['role'] = role;
+    if (patch.isEmpty) return {'success': false, 'message': 'Nothing to change.'};
+    try {
+      await _db.collection('staff').doc(staffId).update(patch);
+      return {'success': true, 'message': 'Staff account updated.'};
+    } on FirebaseException catch (e) {
+      if (e.code == 'permission-denied') {
+        return {
+          'success': false,
+          'message': 'Only a super admin can change another staff account.',
+        };
+      }
+      return {'success': false, 'message': friendlyError(e)};
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
     }

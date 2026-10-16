@@ -156,6 +156,16 @@ class _QRScanScreenState extends State<QRScanScreen> {
   void _showReturnSheet(Map<String, dynamic> equipment) {
     final status      = equipment['status'] ?? 'Unknown';
     final isBorrowed  = status == 'Borrowed';
+    // Not-Borrowed does not mean Available: an item can be Under Repair or
+    // For Disposal. This sheet used to paint the badge green and say "already
+    // Available" for all three. Found on the emulator 2026-09-21 by scanning
+    // an Under Repair item, which reported itself Available.
+    final isAvailable = status == 'Available';
+    final statusColor = isBorrowed
+        ? AppTheme.warning
+        : isAvailable
+            ? AppTheme.success
+            : AppTheme.danger;
     final equipName   = equipment['equipment_name'] ?? '';
     final equipId     = '${equipment['equipment_id']}';
 
@@ -180,10 +190,9 @@ class _QRScanScreenState extends State<QRScanScreen> {
           Container(
             width: 60, height: 60,
             decoration: BoxDecoration(
-                color: (isBorrowed ? AppTheme.warning : AppTheme.success).withValues(alpha: 0.12),
+                color: statusColor.withValues(alpha: 0.12),
                 borderRadius: BorderRadius.circular(16)),
-            child: Icon(Icons.science_outlined,
-                color: isBorrowed ? AppTheme.warning : AppTheme.success, size: 30),
+            child: Icon(Icons.science_outlined, color: statusColor, size: 30),
           ),
           const SizedBox(height: 12),
           Text(equipName,
@@ -196,9 +205,7 @@ class _QRScanScreenState extends State<QRScanScreen> {
           const SizedBox(height: 12),
 
           Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            StatusBadge(
-                label: status,
-                color: isBorrowed ? AppTheme.warning : AppTheme.success),
+            StatusBadge(label: status, color: statusColor),
             if (equipment['location'] != null) ...[
               const SizedBox(width: 8),
               StatusBadge(label: equipment['location'], color: AppTheme.textMid),
@@ -243,14 +250,18 @@ class _QRScanScreenState extends State<QRScanScreen> {
             Container(
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
-                  color: const Color(0x1406D6A0),
+                  color: statusColor.withValues(alpha: 0.08),
                   borderRadius: BorderRadius.circular(12)),
-              child: const Row(children: [
-                Icon(Icons.info_outline_rounded, color: AppTheme.success, size: 18),
-                SizedBox(width: 10),
+              child: Row(children: [
+                Icon(Icons.info_outline_rounded, color: statusColor, size: 18),
+                const SizedBox(width: 10),
                 Expanded(child: Text(
-                  'This equipment is already Available — no return needed.',
-                  style: TextStyle(fontSize: 13, color: AppTheme.textDark),
+                  isAvailable
+                      ? 'This equipment is already Available — no return '
+                          'needed.'
+                      : 'This equipment is marked $status and is not out on '
+                          'loan, so there is nothing to return.',
+                  style: const TextStyle(fontSize: 13, color: AppTheme.textDark),
                 )),
               ]),
             ),

@@ -5,8 +5,11 @@
 // -----------------------------------------------------------------------------
 
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
+import '../../constants.dart';
 import '../../services/api_service.dart';
 import '../../services/session.dart';
 import '../../theme.dart';
@@ -19,6 +22,8 @@ import 'admin_reports_screen.dart';
 import 'admin_damage_reports_screen.dart';
 import 'admin_penalties_screen.dart';
 import 'admin_students_screen.dart';
+import 'staff_profile_screen.dart';
+import 'admin_staff_accounts_screen.dart';
 
 // ─── Admin Dashboard Screen ────────────────────────────────────────────────────
 
@@ -30,6 +35,7 @@ class AdminDashboardScreen extends StatefulWidget {
 
 class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   int _currentIndex = 0;
+  StreamSubscription<Map<String, dynamic>?>? _account;
 
   @override
   void initState() {
@@ -41,14 +47,84 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
             MaterialPageRoute(builder: (_) => const LoginScreen()));
       }
     });
+    if (Session.role == 'staff' && Session.staffId.isNotEmpty) {
+      // Errors are ignored: the only expected one is a legacy account whose
+      // document id is not its uid, which the rules refuse — and such an
+      // account can change nothing anyway.
+      _account = ApiService.staffSelfStream(Session.staffId)
+          .listen(_onAccount, onError: (_) {});
+    }
   }
 
-  final List<Widget> _pages = [
-    const _AdminHome(),
-    const AdminRequestsScreen(),
-    const AdminInventoryScreen(),
-    const AdminReportsScreen(),
-  ];
+  @override
+  void dispose() {
+    _account?.cancel();
+    super.dispose();
+  }
+
+  // QA 2026-09-23, F2. The portal used to read the account once, at sign-in,
+  // so when a super admin changed this account's access level the device
+  // kept the old badge and buttons until the person signed out, and every
+  // write was refused with a bare "You do not have permission to do that."
+  // It now follows its own staff document and redraws when the level changes.
+  void _onAccount(Map<String, dynamic>? doc) {
+    if (!mounted || Session.role != 'staff') return;
+    if (doc == null) {
+      _accountRemoved();
+      return;
+    }
+    final change = Session.refreshStaff(doc);
+    if (!change.nameChanged && !change.roleChanged) return;
+    if (change.narrowed) {
+      // A screen or sheet open on top may still offer an action this account
+      // no longer has, so close everything back to the portal.
+      final portal = ModalRoute.of(context);
+      if (portal != null) Navigator.of(context).popUntil((r) => r == portal);
+    }
+    setState(() {});
+    if (change.roleChanged) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Your access level was changed to '
+            '${staffRoleName(Session.staffRole)}.'),
+        behavior: SnackBarBehavior.floating,
+      ));
+    }
+  }
+
+  // The account's staff document was deleted (console only — no client can).
+  // Nothing this device offers would be accepted any more, so end the session.
+  Future<void> _accountRemoved() async {
+    final navigator = Navigator.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    await _account?.cancel();
+    _account = null;
+    await ApiService.signOut();
+    navigator.pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()), (_) => false);
+    messenger.showSnackBar(const SnackBar(
+      content: Text('This staff account has been removed. '
+          'Please contact an administrator.'),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  // Built fresh on every build, and _AdminHome deliberately NOT const.
+  //
+  // The home page greets the signed-in staff member by name. A const widget is
+  // canonicalised, so returning the same instance makes Flutter treat the
+  // subtree as unchanged and skip it: after the Staff Profile screen renamed
+  // the account, setState here reached the app bar but the header underneath
+  // still read the old name (found while verifying the rename on the emulator,
+  // 2026-09-23 — the same shape as the stale dashboard fixed in 41c1c50).
+  // A new instance of the same type rebuilds the subtree while keeping its
+  // State, so the stats already loaded are not re-fetched.
+  List<Widget> get _pages => [
+        // ignore: prefer_const_constructors
+        _AdminHome(),
+        const AdminRequestsScreen(),
+        const AdminInventoryScreen(),
+        const AdminReportsScreen(),
+      ];
 
   void _confirmSignOut(BuildContext context) {
     showDialog(
@@ -70,6 +146,10 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
               // not used across an async gap.
               final navigator = Navigator.of(context);
               navigator.pop();
+              // Stop following the account first: once signed out, the
+              // listener would be refused and log a PERMISSION_DENIED.
+              await _account?.cancel();
+              _account = null;
               await ApiService.signOut();
               navigator.pushReplacement(
                   MaterialPageRoute(builder: (_) => const LoginScreen()));
@@ -99,6 +179,19 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
         ),
         actions: [
           IconButton(
+            tooltip: 'My Profile',
+            icon: const Icon(Icons.account_circle_outlined, color: Colors.white),
+            onPressed: () async {
+              await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => const StaffProfileScreen()));
+              // The dashboard header greets the signed-in staff member by name,
+              // so redraw it in case the name was just changed.
+              if (mounted) setState(() {});
+            },
+          ),
+          IconButton(
             tooltip: 'Sign Out',
             icon: const Icon(Icons.logout_rounded, color: Colors.white),
             onPressed: () => _confirmSignOut(context),
@@ -107,7 +200,16 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
       ),
       body: Column(
         children: [
-          Expanded(child: _pages[_currentIndex]),
+          // Keyed on the access level so a change picked up by _onAccount
+          // rebuilds the open tab from scratch. Three of the four pages are
+          // const, and setState skips a const page, so their Approve and Edit
+          // buttons would otherwise outlive the level that allowed them.
+          Expanded(
+            child: KeyedSubtree(
+              key: ValueKey(Session.canManage),
+              child: _pages[_currentIndex],
+            ),
+          ),
         ],
       ),
       bottomNavigationBar: Container(
@@ -165,6 +267,20 @@ class _AdminHomeState extends State<_AdminHome> {
   void initState() {
     super.initState();
     _load();
+  }
+
+  // Every screen the Dashboard pushes can change a number the Dashboard shows:
+  // a QR return clears an active loan and can add a damage report and a hold;
+  // resolving a report frees an item and lifts a hold; Penalties and Students
+  // both change the hold count. None of them reloaded on the way back, so
+  // staff processed a return and the Dashboard went on listing the item as an
+  // active — often overdue — loan until the app was restarted. Same family as
+  // QA 2026-09-19 M4; found on the emulator 2026-09-21 while testing the QR
+  // return flow.
+  Future<void> _openThenReload(Widget page) async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => page));
+    if (!mounted) return;
+    await _load();
   }
 
   Future<void> _load() async {
@@ -308,7 +424,7 @@ class _AdminHomeState extends State<_AdminHome> {
                                   child: Text(
                                       Session.isViewer
                                           ? 'VIEW ONLY'
-                                          : Session.staffRole.toUpperCase(),
+                                          : Session.staffRoleLabel,
                                       style: const TextStyle(
                                           color: AppTheme.accent,
                                           fontSize: 11,
@@ -437,8 +553,8 @@ class _AdminHomeState extends State<_AdminHome> {
                         SizedBox(
                           width: double.infinity,
                           child: ElevatedButton.icon(
-                            onPressed: () => Navigator.push(context,
-                                MaterialPageRoute(builder: (_) => const QRScanScreen())),
+                            onPressed: () =>
+                                _openThenReload(const QRScanScreen()),
                             icon: const Icon(Icons.qr_code_scanner_rounded),
                             label: const Text('Scan QR to Process Return'),
                             style: ElevatedButton.styleFrom(
@@ -452,8 +568,8 @@ class _AdminHomeState extends State<_AdminHome> {
                       // ── Damage reports + penalties quick access (all staff) ──
                       Row(children: [
                         Expanded(child: OutlinedButton.icon(
-                          onPressed: () => Navigator.push(context,
-                              MaterialPageRoute(builder: (_) => const AdminDamageReportsScreen())),
+                          onPressed: () =>
+                              _openThenReload(const AdminDamageReportsScreen()),
                           icon: const Icon(Icons.report_problem_outlined, size: 18),
                           label: Text('Damage (${_stats['damage_reports'] ?? 0})'),
                           style: OutlinedButton.styleFrom(
@@ -464,8 +580,8 @@ class _AdminHomeState extends State<_AdminHome> {
                         )),
                         const SizedBox(width: 12),
                         Expanded(child: OutlinedButton.icon(
-                          onPressed: () => Navigator.push(context,
-                              MaterialPageRoute(builder: (_) => const AdminPenaltiesScreen())),
+                          onPressed: () =>
+                              _openThenReload(const AdminPenaltiesScreen()),
                           icon: const Icon(Icons.gpp_maybe_outlined, size: 18),
                           label: const Text('Penalties'),
                           style: OutlinedButton.styleFrom(
@@ -476,12 +592,32 @@ class _AdminHomeState extends State<_AdminHome> {
                         )),
                       ]),
                       const SizedBox(height: 12),
+                      // ── Staff accounts (super admin only) ──
+                      // The rules refuse this to everyone else, so hiding it is
+                      // a courtesy, not the control.
+                      if (Session.isSuper) ...[
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: () =>
+                                _openThenReload(const AdminStaffAccountsScreen()),
+                            icon: const Icon(Icons.manage_accounts_outlined, size: 18),
+                            label: const Text('Staff Accounts'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppTheme.accent,
+                              side: const BorderSide(color: AppTheme.accent),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                      ],
                       // ── Students directory (all staff; viewer is read-only) ──
                       SizedBox(
                         width: double.infinity,
                         child: OutlinedButton.icon(
-                          onPressed: () => Navigator.push(context,
-                              MaterialPageRoute(builder: (_) => const AdminStudentsScreen())),
+                          onPressed: () =>
+                              _openThenReload(const AdminStudentsScreen()),
                           icon: const Icon(Icons.people_alt_outlined, size: 18),
                           label: const Text('Students'),
                           style: OutlinedButton.styleFrom(

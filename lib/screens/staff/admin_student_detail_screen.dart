@@ -147,7 +147,7 @@ class _AdminStudentDetailScreenState extends State<AdminStudentDetailScreen> {
           decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
           child: Row(children: [
             CircleAvatar(radius: 28, backgroundColor: const Color(0x141B3A8C),
-              child: Text(_initials(name),
+              child: Text(Session.initialsOf(name),
                   style: const TextStyle(color: AppTheme.primary, fontWeight: FontWeight.bold, fontSize: 18))),
             const SizedBox(width: 14),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -336,13 +336,6 @@ class _AdminStudentDetailScreenState extends State<AdminStudentDetailScreen> {
         StatusBadge(label: status, color: color),
       ]),
     );
-  }
-
-  String _initials(String name) {
-    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
-    if (parts.isEmpty) return '?';
-    if (parts.length == 1) return parts[0][0].toUpperCase();
-    return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
   }
 
   String _memberSince() {
