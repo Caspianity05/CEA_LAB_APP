@@ -173,75 +173,119 @@ class _StudentDashboardState extends State<_StudentDashboard> {
         .toList();
   }
 
+  static DateTime? _dueOf(dynamic loan) =>
+      DateTime.tryParse('${loan['due_date']}'.replaceAll(' ', 'T'));
+
+  // "Beaker 1000 mL #1" for one unit; "Beaker 1000 mL × 2, Flask 500 mL" for more.
+  static String _itemsOf(List<dynamic> units) => units.length == 1
+      ? '${units.first['equipment_name'] ?? 'Equipment'}'
+      : ApiService.requestSummary(units);
+
   List<Map<String, dynamic>> _buildNotifications() {
     final notes = <Map<String, dynamic>>[];
-    for (final loan in _allLoans) {
-      final status   = loan['status'] ?? '';
-      final equipName= loan['equipment_name'] ?? 'Equipment';
-      final due      = DateTime.tryParse('${loan['due_date']}'.replaceAll(' ', 'T'));
-      final now      = DateTime.now();
+    final now   = DateTime.now();
+
+    // Every card is built once per request, not once per unit: a request for
+    // three beakers is one approval (2026-10-05), one "Due Today" and one
+    // "Return Confirmed" (2026-10-06: three per-unit "Due Today" cards, dated
+    // 5:00 PM, sorted above the approval and pushed it out of Home's three
+    // slots, so the student never saw "Pick it up at the lab").
+    for (final request in ApiService.groupRequests(_allLoans)) {
+      final approved = request.where((t) => t['status'] == 'Approved').toList();
+      final returned = request.where((t) => t['status'] == 'Returned').toList();
+      final rejected = request.where((t) => t['status'] == 'Rejected').toList();
+
+      // Check overdue FIRST. The due date is 5:00 PM the same day, so an
+      // item borrowed today and not returned by 5 is both "due today" and
+      // overdue — and the due-today branch used to win, leaving the card
+      // reading "due back today before 5:00 PM" at 10 PM while the Active
+      // Loans list right below it badged the very same item "Overdue".
+      final overdue = approved.where((t) {
+        final due = _dueOf(t);
+        return due != null && due.isBefore(now);
+      }).toList();
+      final dueToday = approved.where((t) {
+        final due = _dueOf(t);
+        return due != null && !due.isBefore(now) &&
+            due.year == now.year && due.month == now.month && due.day == now.day;
+      }).toList();
 
       // Each card type honours the corresponding toggle in
       // Profile → Notifications (NotifPrefs).
-      if (status == 'Approved' && due != null) {
-        // Check overdue FIRST. The due date is 5:00 PM the same day, so an
-        // item borrowed today and not returned by 5 is both "due today" and
-        // overdue — and the due-today branch used to win, leaving the card
-        // reading "due back today before 5:00 PM" at 10 PM while the Active
-        // Loans list right below it badged the very same item "Overdue".
-        if (NotifPrefs.overdue && due.isBefore(now)) {
-          notes.add({
-            'icon':  Icons.warning_amber_rounded,
-            'color': AppTheme.danger,
-            'title': 'Overdue!',
-            'body':  '$equipName was due on ${due.month}/${due.day}. Please return it immediately.',
-            'at':    due,
-            'live':  true,
-          });
-        } else if (NotifPrefs.dueSoon &&
-            due.year == now.year && due.month == now.month && due.day == now.day) {
-          notes.add({
-            'icon':  Icons.access_alarm_rounded,
-            'color': AppTheme.warning,
-            'title': 'Due Today',
-            'body':  '$equipName is due back today before 5:00 PM.',
-            'at':    due,
-            'live':  true,
-          });
-        }
+      if (NotifPrefs.overdue && overdue.isNotEmpty) {
+        final due = _dueOf(overdue.first)!;
+        final one = overdue.length == 1;
+        notes.add({
+          'icon':  Icons.warning_amber_rounded,
+          'color': AppTheme.danger,
+          'title': 'Overdue!',
+          'body':  '${_itemsOf(overdue)} ${one ? 'was' : 'were'} due on '
+              '${due.month}/${due.day}. Please return ${one ? 'it' : 'them'} immediately.',
+          'at':    due,
+          'live':  true,
+        });
       }
+      if (NotifPrefs.dueSoon && dueToday.isNotEmpty) {
+        notes.add({
+          'icon':  Icons.access_alarm_rounded,
+          'color': AppTheme.warning,
+          'title': 'Due Today',
+          'body':  '${_itemsOf(dueToday)} ${dueToday.length == 1 ? 'is' : 'are'} '
+              'due back today before 5:00 PM.',
+          'at':    _dueOf(dueToday.first)!,
+          'live':  true,
+        });
+      }
+      if (NotifPrefs.returnConfirmed && returned.isNotEmpty) {
+        // Dated by the latest return, so the card moves up as the rest of the
+        // request comes back.
+        var at = DateTime(2000);
+        for (final t in returned) {
+          final d = ApiService.asDate(t['return_date']) ??
+              ApiService.asDate(t['borrow_date']);
+          if (d != null && d.isAfter(at)) at = d;
+        }
+        notes.add({
+          'icon':  Icons.assignment_turned_in_rounded,
+          'color': AppTheme.success,
+          'title': 'Return Confirmed',
+          'body':  'Your return of ${_itemsOf(returned)} has been confirmed by staff.',
+          'at':    at,
+        });
+      }
+
       // Acknowledge the approval regardless of the due date. This used to
       // require `!due.isBefore(now)`, which silently suppressed the card for
       // anything approved after 5:00 PM — and since the due date IS 5:00 PM
       // the same day, every evening approval landed already past due. The
       // student got no confirmation at all that staff had approved them.
-      if (NotifPrefs.approved && status == 'Approved' && due != null) {
-        notes.add({
-          'icon':  Icons.check_circle_rounded,
-          'color': AppTheme.success,
-          'title': 'Request Approved',
-          'body':  'Your request for $equipName has been approved.',
-          'at':    ApiService.asDate(loan['approved_at']) ?? due,
-        });
+      if (NotifPrefs.approved && approved.isNotEmpty) {
+        final first = approved.first;
+        final at = ApiService.asDate(first['approved_at']) ??
+            ApiService.asDate(first['due_date']);
+        if (at != null) {
+          notes.add({
+            'icon':  Icons.check_circle_rounded,
+            'color': AppTheme.success,
+            'title': 'Request Approved',
+            'body':  'Your request for ${ApiService.requestSummary(approved)} '
+                'has been approved. Pick it up at the lab.',
+            'at':    at,
+          });
+        }
       }
-      if (NotifPrefs.rejected && status == 'Rejected') {
+      if (NotifPrefs.rejected && rejected.isNotEmpty) {
+        final first = rejected.first;
+        // The reason staff typed used to be saved but never shown here.
+        final reason = '${first['reject_reason'] ?? ''}'.trim();
         notes.add({
           'icon':  Icons.cancel_rounded,
           'color': AppTheme.danger,
           'title': 'Request Rejected',
-          'body':  'Your request for $equipName was rejected by staff.',
-          'at':    ApiService.asDate(loan['rejected_at']) ??
-                   ApiService.asDate(loan['borrow_date']) ?? DateTime(2000),
-        });
-      }
-      if (NotifPrefs.returnConfirmed && status == 'Returned') {
-        notes.add({
-          'icon':  Icons.assignment_turned_in_rounded,
-          'color': AppTheme.success,
-          'title': 'Return Confirmed',
-          'body':  'Your return of $equipName has been confirmed by staff.',
-          'at':    ApiService.asDate(loan['return_date']) ??
-                   ApiService.asDate(loan['borrow_date']) ?? DateTime(2000),
+          'body':  'Your request for ${ApiService.requestSummary(rejected)} was '
+              'rejected by staff${reason.isEmpty ? '.' : ': $reason'}',
+          'at':    ApiService.asDate(first['rejected_at']) ??
+                   ApiService.asDate(first['borrow_date']) ?? DateTime(2000),
         });
       }
     }
@@ -422,7 +466,9 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                                 ),
                                 const SizedBox(width: 10),
                                 _HeroStat(
-                                  value: '${_pendingLoans.length}',
+                                  // Requests, not units, as on the staff
+                                  // dashboard: three beakers are one request.
+                                  value: '${ApiService.groupRequests(_pendingLoans).length}',
                                   label: 'Pending\nRequests',
                                   icon: Icons.pending_actions_rounded,
                                   accent: const Color(0xFF60A5FA),

@@ -17,6 +17,12 @@ rules_version = '2';
 //                superadmin demoting itself and leaving the system with none.
 //
 // Authorisation is enforced server-side here so the client cannot bypass it.
+//
+// 2026-10-03 hardening (QA qa-2026-10-03-pentest): every value a student writes
+// is now checked against the record it claims to come from — the student's own
+// profile, the equipment item, the server clock — instead of being trusted as
+// sent. The app already wrote these values correctly; the rules now make that
+// true for any client.
 // ─────────────────────────────────────────────────────────────────────────────
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -47,18 +53,52 @@ service cloud.firestore {
       return r in ['superadmin', 'admin', 'staff', 'viewer'];
     }
 
+    // Shape checks for the student-editable profile fields. Type matters as
+    // much as content: staff screens render these for every student, so a
+    // name stored as a number or a map must never get in (2026-10-03).
+    // Lengths are generous on purpose — the forms set no maximum, and a real
+    // name must never be refused here.
+    function studentNameOk(n) {
+      return n is string && n.trim().size() >= 1 && n.size() <= 100;
+    }
+    function courseOk(c) {
+      return c is string && c.size() <= 60;
+    }
+
+    // The signed-in student's own profile.
+    function myProfile() {
+      return get(/databases/$(database)/documents/students/$(request.auth.uid)).data;
+    }
+
+    // Server-side copy of the app's e-mail gate (ApiService.passesVerificationGate):
+    // a verified address, or an account made before demo mode closed
+    // (kLegacyAccountCutoff, 2026-08-03 UTC). Until 2026-10-03 this gate lived
+    // only in the app, so an unverified account could still act through
+    // another client.
+    function verifiedOrLegacy(p) {
+      return request.auth.token.email_verified == true
+        || !('created_at' in p)
+        || p.created_at < timestamp.date(2026, 8, 3);
+    }
+
     // Public lookup so a student can resolve their student number → email
     // BEFORE authenticating. Holds only {email, uid}. Hardened:
     //   • get-only — list is blocked so the collection cannot be dumped to
     //     harvest student emails (Data Privacy Act of 2012 consideration).
     //   • create must carry the caller's own uid and token email, so one
     //     account cannot "squat" another student's number.
-    //   • a student may delete only their own mapping (registration rollback).
-    //   • create is allowed ONLY while registering — the caller must not already
-    //     have a /students profile. The app claims the number BEFORE it writes
-    //     students/{uid}, so a finished account can no longer mint mappings.
-    //     Without this a signed-in student could claim every unregistered
-    //     number and lock real students out of sign-up (QA 2026-09-19, P01).
+    //   • ONE number per account, and only the number on the caller's own
+    //     profile (2026-10-03, R1). Registration writes this mapping and the
+    //     students/{uid} profile in a single batch; getAfter() sees the profile
+    //     that batch is creating and requires its student_number to be this
+    //     document's id. Since a student can never change their own
+    //     student_number afterwards (see /students update), an account can
+    //     never claim a second number. The old rule only required "no profile
+    //     yet", so an account that skipped the profile step could claim any
+    //     number of unregistered numbers and lock those students out.
+    //   • nobody deletes a mapping from a client any more. Deleting it was
+    //     only ever for rolling back a half-finished registration, and the
+    //     batch makes that impossible: both writes land or neither does.
     match /student_lookup/{studentNumber} {
       allow get:    if true;
       allow list:   if false;
@@ -66,9 +106,10 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['email', 'uid'])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.email == request.auth.token.email
-        && !exists(/databases/$(database)/documents/students/$(request.auth.uid));
+        && getAfter(/databases/$(database)/documents/students/$(request.auth.uid))
+             .data.student_number == studentNumber;
       allow update: if false;
-      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow delete: if false;
     }
 
     // Student profiles. A student may read/create only their own doc, and may
@@ -78,19 +119,47 @@ service cloud.firestore {
     match /students/{uid} {
       allow read:   if request.auth.uid == uid || isStaff();
       // Create is the registration write and nothing else: exactly the fields
-      // the app sends, and never with the hold flag set by hand. The old rule
-      // accepted any shape at all, including invented privilege fields
-      // (QA 2026-09-19, P07).
+      // the app sends, and never with the hold flag set by hand (QA
+      // 2026-09-19, P07). From 2026-10-03 it must also:
+      //   • be stamped by the server clock. The app's e-mail gate treats a
+      //     profile with no created_at, or one from before the cutoff, as a
+      //     pre-verification account and lets it skip verification, so a
+      //     client-chosen value could buy its way past the gate.
+      //   • belong to an @neu.edu.ph account, carrying that account's own
+      //     address — the same rule the sign-up form enforces.
+      //   • carry a student number in the official ##-#####-### form, which
+      //     this same batch claims in /student_lookup for this account. Two
+      //     accounts can therefore never hold the same number.
       allow create: if request.auth.uid == uid
         && request.resource.data.keys().hasOnly([
              'name', 'email', 'student_number', 'course', 'year_level',
              'hold', 'hold_reason', 'created_at'])
-        && request.resource.data.hold == false;
+        && request.resource.data.hold == false
+        && request.resource.data.hold_reason == ''
+        && request.resource.data.created_at == request.time
+        && request.resource.data.email == request.auth.token.email
+        && request.auth.token.email.lower().matches('.*@neu[.]edu[.]ph$')
+        && studentNameOk(request.resource.data.name)
+        && courseOk(request.resource.data.course)
+        && request.resource.data.year_level is int
+        && request.resource.data.student_number is string
+        && request.resource.data.student_number.matches('^[0-9]{2}-[0-9]{5}-[0-9]{3}$')
+        && getAfter(/databases/$(database)/documents/student_lookup/$(request.resource.data.student_number))
+             .data.uid == request.auth.uid;
       allow update: if isManager()
-        || (request.auth.uid == uid
-            && request.resource.data.diff(resource.data).affectedKeys()
-                 .hasOnly(['name', 'course', 'year_level']));
+        || (request.auth.uid == uid && studentSelfEditOk());
       allow delete: if isManager();
+
+      // Edit Profile: name, course and year level only, each of the right
+      // type. Only fields that actually change are checked, so an older
+      // profile with an odd stored value can still be edited.
+      function studentSelfEditOk() {
+        let changed = request.resource.data.diff(resource.data).affectedKeys();
+        return changed.hasOnly(['name', 'course', 'year_level'])
+          && (!changed.hasAny(['name']) || studentNameOk(request.resource.data.name))
+          && (!changed.hasAny(['course']) || courseOk(request.resource.data.course))
+          && (!changed.hasAny(['year_level']) || request.resource.data.year_level is int);
+      }
     }
 
     // Staff accounts are provisioned out-of-band (Firebase console or
@@ -166,6 +235,18 @@ service cloud.firestore {
     //   • the deadline must fall inside 24 hours — the server-side floor under
     //     the same-day 5:00 PM policy the form enforces. Without it a raw
     //     caller could ask for a months-long loan (P02).
+    // And from 2026-10-03 (R2), every copied value must match its source:
+    //   • borrower_name / student_number are the caller's OWN profile values,
+    //     which is what borrowEquipment writes (QA H5). Staff read these on
+    //     every request card, and the rules used to accept any text;
+    //   • equipment_name / qr_code / category / photo_thumb are the reserved
+    //     item's own values, and the item must exist and be Available. Approval
+    //     marks equipment_id as Borrowed, so a card naming one item while
+    //     reserving another would send the wrong unit out with no loan on it;
+    //   • borrow_date is the server clock, and every other field has the type
+    //     the staff screens expect, so no request can carry a value that stops
+    //     the staff lists from loading;
+    //   • the caller passed the e-mail gate (verifiedOrLegacy).
     match /borrow_transactions/{id} {
       allow read:   if isStaff()
         || (signedIn() && resource.data.student_id == request.auth.uid);
@@ -180,9 +261,40 @@ service cloud.firestore {
         && 'due_date' in request.resource.data
         && request.resource.data.due_date is timestamp
         && request.resource.data.due_date < request.time + duration.value(1, 'd')
-        && get(/databases/$(database)/documents/students/$(request.auth.uid)).data.hold != true;
+        && request.resource.data.borrow_date == request.time
+        && request.resource.data.return_date == null
+        && request.resource.data.quantity is int
+        && request.resource.data.quantity >= 1
+        && request.resource.data.quantity <= 10
+        && request.resource.data.subject is string
+        && request.resource.data.subject.size() <= 200
+        && request.resource.data.purpose is string
+        && request.resource.data.purpose.size() <= 2000
+        && borrowerOk()
+        && equipmentOk();
       allow update: if isManager();
       allow delete: if false;
+
+      // The requester: not on hold, past the e-mail gate, and named on the
+      // request exactly as their own profile names them.
+      function borrowerOk() {
+        let p = myProfile();
+        return p.hold != true
+          && verifiedOrLegacy(p)
+          && request.resource.data.borrower_name == p.name
+          && request.resource.data.student_number == p.student_number;
+      }
+      // The item: exists, is Available, and every value the request copies
+      // from it is the item's own. Missing optional fields compare as their
+      // defaults, the same way borrowEquipment fills them.
+      function equipmentOk() {
+        let e = get(/databases/$(database)/documents/equipment/$(request.resource.data.equipment_id)).data;
+        return e.status == 'Available'
+          && request.resource.data.equipment_name == e.equipment_name
+          && request.resource.data.get('qr_code', null) == e.get('qr_code', null)
+          && request.resource.data.get('category', '') == e.get('category', '')
+          && request.resource.data.get('photo_thumb', null) == e.get('photo_thumb', null);
+      }
     }
 
     // Damage reports: a student may file one only against themselves; a manager
@@ -192,15 +304,36 @@ service cloud.firestore {
     //     landing them with a hold they never earned (P04);
     //   • and could file one already 'Resolved', so it was never counted as
     //     open and never reached triage (P05).
+    // From 2026-10-03 (R4): only the fields the two report screens send, each
+    // of the expected type, stamped by the server clock. `reported_by` marks a
+    // report staff filed during a QR return, so only a manager may set it. A
+    // student report must also come from an account past the e-mail gate.
     match /damage_reports/{id} {
       allow read:   if isStaff();
       allow create: if signedIn()
         && 'status' in request.resource.data
         && request.resource.data.status == 'Open'
-        && (isManager()
-            || request.resource.data.student_id == request.auth.uid);
+        && request.resource.data.reported_at == request.time
+        && request.resource.data.equipment_id is string
+        && request.resource.data.get('equipment_name', '') is string
+        && request.resource.data.get('borrower_name', '') is string
+        && request.resource.data.get('student_number', '') is string
+        && request.resource.data.get('description', '') is string
+        && request.resource.data.get('description', '').size() <= 2000
+        && (!('severity' in request.resource.data)
+            || request.resource.data.severity in ['Minor', 'Moderate', 'Severe'])
+        && ((isManager()
+              && request.resource.data.keys().hasOnly(damageKeys().concat(['reported_by'])))
+            || (request.resource.data.student_id == request.auth.uid
+              && request.resource.data.keys().hasOnly(damageKeys())
+              && verifiedOrLegacy(myProfile())));
       allow update: if isManager();
       allow delete: if false;
+
+      function damageKeys() {
+        return ['equipment_id', 'equipment_name', 'student_id', 'student_number',
+                'borrower_name', 'severity', 'description', 'status', 'reported_at'];
+      }
     }
 
     // Deny everything not explicitly matched above.

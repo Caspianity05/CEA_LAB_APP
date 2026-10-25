@@ -31,6 +31,12 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   bool _loading = true;
   bool _hasError = false;
   String _search = '';
+  // Keeps the typed text on screen across reloads. Without it, every _load()
+  // (after an edit, a delete or a new registration) swapped the screen for a
+  // spinner and rebuilt the search box empty while _search still filtered the
+  // list, so staff saw an empty box and "No equipment found" (found on the
+  // phone, 2026-10-05).
+  final _searchCtrl = TextEditingController();
   // TODO(scalability): this category filter is single-select, so unlike the
   // student catalog's multi-select it COULD run server-side as
   //   .where('category', isEqualTo: _filter).orderBy('equipment_name')
@@ -67,6 +73,7 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   void dispose() {
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
@@ -297,6 +304,7 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
                 const SizedBox(height: 12),
                 // Search bar
                 TextField(
+                  controller: _searchCtrl,
                   onChanged: (v) => setState(() => _search = v),
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
@@ -385,6 +393,11 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
                                     const SizedBox(height: 2),
                                     Text('${e['qr_code']}  ·  ${e['category']}',
                                         style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+                                    if (ApiService.asDate(e['created_at']) case final added?) ...[
+                                      const SizedBox(height: 2),
+                                      Text('Added ${formatDate(added)}',
+                                          style: const TextStyle(fontSize: 11, color: AppTheme.textLight)),
+                                    ],
                                     const SizedBox(height: 8),
                                     Row(children: [
                                       Expanded(child: StatusBadge(label: status, color: condColor)),
@@ -439,10 +452,13 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
           if (result != null) {
             _load();
             if (!mounted) return;
+            final name  = result['equipment_name'] ?? 'Equipment';
+            final count = result['count'] as int? ?? 1;
             messenger.showSnackBar(
               SnackBar(
-                content: Text(
-                    '${result['equipment_name'] ?? 'Equipment'} registered successfully!'),
+                content: Text(count > 1
+                    ? '$count units of $name registered successfully!'
+                    : '$name registered successfully!'),
                 backgroundColor: AppTheme.success,
                 behavior: SnackBarBehavior.floating,
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -475,8 +491,10 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
   late final TextEditingController _brandCtrl;
   late final TextEditingController _modelCtrl;
   late final TextEditingController _serialCtrl;
+  late final TextEditingController _iinCtrl;
   late final TextEditingController _locationCtrl;
   late final TextEditingController _descCtrl;
+  DateTime? _dateAcquired;
 
   late String? _selectedCategory;
   late String _selectedStatus;
@@ -496,8 +514,10 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
     _brandCtrl    = TextEditingController(text: e['brand']          as String? ?? '');
     _modelCtrl    = TextEditingController(text: e['model']          as String? ?? '');
     _serialCtrl   = TextEditingController(text: e['serial_number']  as String? ?? '');
+    _iinCtrl      = TextEditingController(text: '${e['iin'] ?? ''}');
     _locationCtrl = TextEditingController(text: e['location']       as String? ?? '');
     _descCtrl     = TextEditingController(text: e['description']    as String? ?? '');
+    _dateAcquired = ApiService.asDate(e['date_acquired']);
     _selectedCategory = e['category'] as String?;
     _selectedStatus   = (e['status'] as String?) ?? 'Available';
     _selectedCourses  = List<String>.from((e['courses'] as List?) ?? []);
@@ -506,7 +526,8 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
   @override
   void dispose() {
     _nameCtrl.dispose(); _brandCtrl.dispose(); _modelCtrl.dispose();
-    _serialCtrl.dispose(); _locationCtrl.dispose(); _descCtrl.dispose();
+    _serialCtrl.dispose(); _iinCtrl.dispose(); _locationCtrl.dispose();
+    _descCtrl.dispose();
     super.dispose();
   }
 
@@ -514,6 +535,14 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
     final picked = await _imagePicker.pickImage(
         source: source, imageQuality: 80, maxWidth: 1200);
     if (picked != null) setState(() => _pickedImage = picked);
+  }
+
+  // "Added to the inventory on Oct 2, 2026 by Ramoel Bello". Records made
+  // before 2026-10-05 carry the date but not the name.
+  String _addedLine(DateTime added) {
+    final by = '${widget.equipment['created_by_name'] ?? ''}'.trim();
+    return 'Added to the inventory on ${formatDate(added)}'
+        '${by.isEmpty ? '' : ' by $by'}';
   }
 
   Future<void> _save() async {
@@ -540,6 +569,9 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
         'brand':          _brandCtrl.text.trim(),
         'model':          _modelCtrl.text.trim(),
         'serial_number':  _serialCtrl.text.trim(),
+        'iin':            _iinCtrl.text.trim(),
+        // null clears it, for a date entered by mistake.
+        'date_acquired':  _dateAcquired,
         'description':    _descCtrl.text.trim(),
         'courses':        _selectedCourses,
       });
@@ -632,6 +664,19 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
           Expanded(
             child: ListView(controller: scroll, padding: const EdgeInsets.all(20),
               children: [
+                // When, and by whom, this record was added (read-only).
+                if (ApiService.asDate(widget.equipment['created_at']) case final added?) ...[
+                  Row(children: [
+                    const Icon(Icons.history_rounded, size: 16, color: AppTheme.textMid),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(_addedLine(added),
+                          style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+                    ),
+                  ]),
+                  const SizedBox(height: 16),
+                ],
+
                 // Photo picker
                 FieldLabel('Equipment Photo'),
                 const SizedBox(height: 8),
@@ -798,6 +843,25 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                     hintText: 'e.g. SN-20241105-001',
                     prefixIcon: Icon(Icons.tag_rounded, color: AppTheme.textMid),
                   ),
+                ),
+                const SizedBox(height: 16),
+
+                FieldLabel('IIN (Item Identification No.)'),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _iinCtrl,
+                  decoration: const InputDecoration(
+                    hintText: "From the custodian's inventory list",
+                    prefixIcon: Icon(Icons.inventory_2_outlined, color: AppTheme.textMid),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                FieldLabel('Date Acquired'),
+                const SizedBox(height: 8),
+                DateField(
+                  value: _dateAcquired,
+                  onChanged: (d) => setState(() => _dateAcquired = d),
                 ),
                 const SizedBox(height: 16),
 

@@ -16,8 +16,8 @@
 // `version: <kAppVersion>+<kAppBuild>` in step. Dart cannot read pubspec at
 // runtime without adding the package_info_plus plugin, which is not worth a new
 // native dependency this close to the defense.
-const kAppVersion = '1.0.7';
-const kAppBuild = 8;
+const kAppVersion = '1.0.14';
+const kAppBuild = 15;
 
 // What the About screen prints, e.g. "Version 1.0.1 (build 2)".
 const kAppVersionLabel = 'Version $kAppVersion (build $kAppBuild)';
@@ -52,6 +52,19 @@ const kCategories = [
 
 // Equipment availability / condition statuses.
 const kStatuses = ['Available', 'Borrowed', 'Under Repair', 'For Disposal'];
+
+// Most units one Register Equipment submission may create. Each unit becomes
+// its own record with its own QR code; the lab's largest single line is 135
+// sieves (CE sheet), and the cap stops a stray extra zero from writing a
+// thousand records. Larger lots can be registered in several goes, since the
+// numbering carries on.
+const kMaxUnitsPerRegistration = 200;
+
+// Most units one borrow request may reserve. The request is written as one
+// batch, one record per unit, and the security rules read two documents for
+// each record (the student's profile and the unit); a batch may make at most
+// 20 such reads, so 8 leaves room.
+const kMaxUnitsPerRequest = 8;
 
 // ─── Staff access levels ──────────────────────────────────────────────────────
 // Mirrors the roles firestore.rules knows about. 'superadmin' was added on
@@ -91,3 +104,13 @@ const kStaffRoleBlurbs = {
       'this account needs a verified email address to sign in.',
   'viewer':     'Can see everything, but cannot change anything.',
 };
+
+// ─── Dates ────────────────────────────────────────────────────────────────────
+const _kMonthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// A calendar date for people to read, e.g. "May 6, 1992". Used for the
+// equipment dates (acquired / added); the lab's own inventory sheet writes
+// "6/May/92", and an all-number form would be ambiguous between 5/6 and 6/5.
+String formatDate(DateTime d) =>
+    '${_kMonthNames[d.month - 1]} ${d.day}, ${d.year}';

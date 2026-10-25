@@ -10,6 +10,7 @@
 // stay library-private alongside it.
 // -----------------------------------------------------------------------------
 
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -57,6 +58,10 @@ bool _isLegacyAccount(Map<String, dynamic>? profile) {
   if (ts is! Timestamp) return true; // missing/unset → predates the field
   return ts.toDate().isBefore(kLegacyAccountCutoff);
 }
+
+// One line of a borrow request: an item type ("Beaker 1000 mL"), how many
+// units, and optionally the unit the student was looking at, reserved first.
+typedef BorrowLine = ({String name, int quantity, String preferId});
 
 // ─── Firebase Service ─────────────────────────────────────────────────────────
 class ApiService {
@@ -260,14 +265,17 @@ class ApiService {
 
   static Future<Map<String, dynamic>> registerStudent(
       Map<String, dynamic> data) async {
-    final email    = data['email'] as String;
+    // One spelling of the address everywhere: Auth, the lookup and the
+    // profile. The rules compare the stored address with the account's own
+    // (firestore.rules), so a mixed-case entry must not reach them in two
+    // different forms.
+    final email    = (data['email'] as String).trim().toLowerCase();
     final password = data['password'] as String;
     final name     = '${data['first_name']} ${data['last_name']}';
     final studentNumber = data['student_number'] as String;
     final lookupRef = _db.collection('student_lookup').doc(studentNumber);
 
     UserCredential? cred;
-    var lookupWritten = false;
     try {
       // Step 1: Create Firebase Auth user first
       try {
@@ -286,35 +294,46 @@ class ApiService {
       // Send verification email before Firestore write (skipped in demo mode)
       if (!kDemoMode) await cred.user!.sendEmailVerification();
 
-      // Step 2: Claim the student number. The security rules only allow
-      // CREATE on student_lookup (never update), so if the number is already
-      // taken this write is rejected by the server — a race-proof uniqueness
-      // check. (The old read-then-check could let two simultaneous
-      // registrations of the same number both pass.)
+      // Step 2: Claim the student number AND save the profile, in one batch.
+      // The rules accept a student_lookup entry only together with the
+      // profile that carries the same number, so an account can hold one
+      // number and no more (QA 2026-10-03, R1). Both writes land or neither
+      // does, so there is no half-finished registration to roll back.
+      //
+      // The claim is still race-proof: the rules only allow CREATE on
+      // student_lookup (never update), so if the number is already taken the
+      // whole batch is rejected by the server. (The old read-then-check could
+      // let two simultaneous registrations of the same number both pass.)
+      final batch = _db.batch()
+        ..set(lookupRef, {'email': email, 'uid': uid})
+        ..set(_db.collection('students').doc(uid), {
+          'name':           name,
+          'email':          email,
+          'student_number': studentNumber,
+          'course':         data['course'] ?? '',
+          'year_level':     data['year_level'] ?? 1,
+          'hold':           false,
+          'hold_reason':    '',
+          'created_at':     FieldValue.serverTimestamp(),
+        });
       try {
-        await lookupRef.set({'email': email, 'uid': uid});
-        lookupWritten = true;
+        await batch.commit();
       } on FirebaseException catch (e) {
-        if (e.code == 'permission-denied') {
-          await cred.user!.delete();
-          return {'success': false, 'message': 'Student ID is already registered.'};
-        }
-        rethrow;
+        if (e.code != 'permission-denied') rethrow;
+        // Refused. The usual reason is a number someone already registered,
+        // but the rules also check the profile itself, so only say "already
+        // registered" when that is actually true.
+        await cred.user!.delete();
+        final taken = await lookupRef.get().then((d) => d.exists, onError: (_) => false);
+        return {
+          'success': false,
+          'message': taken
+              ? 'Student ID is already registered.'
+              : 'Registration was refused. Please check your details and try again.',
+        };
       }
 
-      // Step 3: Save student profile to Firestore
-      await _db.collection('students').doc(uid).set({
-        'name':           name,
-        'email':          email,
-        'student_number': studentNumber,
-        'course':         data['course'] ?? '',
-        'year_level':     data['year_level'] ?? 1,
-        'hold':           false,
-        'hold_reason':    '',
-        'created_at':     FieldValue.serverTimestamp(),
-      });
-
-      // Step 4: Sign out after registration so they go back to login screen
+      // Step 3: Sign out after registration so they go back to login screen
       await _auth.signOut();
 
       return {
@@ -323,10 +342,8 @@ class ApiService {
         'student_id': uid,
       };
     } catch (e) {
-      // Roll back so a half-finished registration doesn't orphan an Auth
-      // account or squat the student number (which would show "already
-      // registered" forever with no working profile behind it).
-      try { if (lookupWritten) await lookupRef.delete(); } catch (_) {}
+      // Roll back the Auth account so the same address can register again.
+      // Firestore needs no clean-up: the batch wrote everything or nothing.
       try { await cred?.user?.delete(); } catch (_) {}
       return {'success': false, 'message': friendlyError(e)};
     }
@@ -412,6 +429,11 @@ class ApiService {
   // into the account that just signed out — including a staff ADMIN account on
   // a shared lab phone. Always go through here.
   static Future<void> signOut() async {
+    // Close every live stream first. A screen still on the widget tree (the
+    // Requests tab, My Borrowings) would otherwise keep its listener open past
+    // the sign-out, the rules would refuse it, and Firestore logged a
+    // PERMISSION_DENIED warning (QA 2026-09-19 section 9; 2026-09-23, F6).
+    await _closeLiveStreams();
     try {
       await _auth.signOut();
     } catch (_) {
@@ -514,55 +536,198 @@ class ApiService {
     return {'success': true, 'data': data};
   }
 
-  static Future<Map<String, dynamic>> addEquipment(
-      Map<String, dynamic> data) async {
+  // ── Registering equipment ─────────────────────────────────────────────────
+  // Every physical unit is its own equipment record, with its own QR code and
+  // status, because a loan, a return scan and a damage report are each about
+  // one particular unit. A Quantity of N on Register Equipment therefore makes
+  // N records named "<name> #1" … "<name> #N", the same shape as the
+  // 2026-10-02 inventory import (Flask 500 mL #1 … #9). Until then the
+  // Quantity box was validated and then thrown away: one record stood in for
+  // the whole lot.
+  //
+  // It takes two calls so that what staff confirm is what gets stored:
+  // planEquipmentUnits picks the names and QR codes for the preview, and
+  // addEquipmentUnits writes exactly those.
+
+  // Names for [quantity] new units of [base], given names already in the
+  // inventory. Numbering carries on after the highest "<base> #n" there, so
+  // registering three more flasks gives #10 … #12, never a second #1. A lone
+  // unit with no numbered siblings keeps the plain name, as before. Numbers
+  // are zero-padded to the width of the highest one (#01 … #10), as the import
+  // did, and never narrower than the padding already in use.
+  // Public and pure so it is unit-testable (see test/).
+  static List<String> unitNames(
+      String base, int quantity, Iterable<String> existing) {
+    final prefix = '$base #';
+    var highest = 0;
+    var width = 1;
+    for (final name in existing) {
+      if (!name.startsWith(prefix)) continue;
+      final digits = name.substring(prefix.length);
+      if (!RegExp(r'^\d+$').hasMatch(digits)) continue;
+      final n = int.tryParse(digits);
+      if (n == null) continue;
+      if (n > highest) highest = n;
+      if (digits.length > width) width = digits.length;
+    }
+    if (quantity == 1 && highest == 0) return [base];
+    final last = highest + quantity;
+    if ('$last'.length > width) width = '$last'.length;
+    return [
+      for (var n = highest + 1; n <= last; n++)
+        '$prefix${'$n'.padLeft(width, '0')}',
+    ];
+  }
+
+  static String _qrPrefix(String category) => category.length >= 3
+      ? category.substring(0, 3).toUpperCase()
+      : category.toUpperCase();
+
+  // [count] QR codes in the app's scheme: the category's first three letters
+  // and the last six digits of the clock ([seed], in ms), stepping by one per
+  // unit and skipping any code in [taken].
+  // Public and pure so it is unit-testable (see test/).
+  static List<String> qrCodesFor(
+      String category, int count, int seed, Set<String> taken) {
+    final prefix = _qrPrefix(category);
+    var s = seed % 1000000;
+    final codes = <String>[];
+    while (codes.length < count) {
+      final code = '$prefix-${'$s'.padLeft(6, '0')}';
+      s = (s + 1) % 1000000;
+      if (!taken.contains(code)) codes.add(code);
+    }
+    return codes;
+  }
+
+  // Picks the names and QR codes for registering [quantity] units of [name].
+  // A clock-based code can land on one already in use (the import took runs
+  // of consecutive codes) and a scan only ever finds the first match, so the
+  // codes already in use just ahead of the clock are fetched and skipped.
+  static Future<Map<String, dynamic>> planEquipmentUnits({
+    required String name,
+    required String category,
+    required int quantity,
+  }) async {
     try {
-      final name     = data['equipment_name'] as String;
-      final category = data['category'] as String;
-      final location = data['location'] ?? '';
-      // Use a caller-supplied QR code when present so the code previewed during
-      // registration matches what is stored; otherwise auto-generate one.
-      final provided = (data['qr_code'] as String?)?.trim() ?? '';
-      final prefix  = category.length >= 3
-          ? category.substring(0, 3).toUpperCase()
-          : category.toUpperCase();
-      final suffix  = DateTime.now().millisecondsSinceEpoch.toString().substring(7);
-      final qrCode  = provided.isNotEmpty ? provided : '$prefix-$suffix';
-      // The condition chosen at registration decides the starting status, so an
-      // item registered as Under Repair / For Disposal is not immediately
-      // borrowable (QA 2026-09-19, M1 — this used to be hard-coded Available).
-      // 'Borrowed' is never a valid starting status: a brand-new item is not on
-      // loan, so anything unrecognised falls back to Available.
-      final condition = (data['condition'] as String?)?.trim() ?? '';
-      final requested = (data['status'] as String?)?.trim() ?? '';
-      final status = kStatuses.contains(requested) && requested != 'Borrowed'
-          ? requested
-          : equipmentStatusForCondition(condition);
-      final ref = await _db.collection('equipment').add({
-        'equipment_name': name,
-        'category':       category,
-        'location':       location,
-        'qr_code':        qrCode,
-        'status':         status,
-        if (condition.isNotEmpty) 'condition': condition,
-        'courses':        (data['courses'] as List?)?.cast<String>() ?? [],
-        'description':    data['description'] ?? '',
-        'brand':          data['brand'] ?? '',
-        'model':          data['model'] ?? '',
-        'serial_number':  data['serial_number'] ?? '',
-        // Photos are written separately by saveEquipmentPhoto once the document
-        // exists and its id is known.
-        'created_at':     FieldValue.serverTimestamp(),
-      });
+      final prefix = '$name #';
+      final siblings = await _db
+          .collection('equipment')
+          .where('equipment_name', isGreaterThanOrEqualTo: prefix)
+          .where('equipment_name', isLessThan: '$prefix')
+          .get();
+      final names = unitNames(name, quantity,
+          siblings.docs.map((d) => '${d.data()['equipment_name']}'));
+
+      final seed = DateTime.now().millisecondsSinceEpoch % 1000000;
+      // Room to step past codes in use without leaving the checked stretch.
+      final span = quantity + 1000;
+      final taken = await _qrCodesInUse(_qrPrefix(category), seed, span);
+      final codes = qrCodesFor(category, quantity, seed, taken);
+      final lastStep =
+          (int.parse(codes.last.split('-').last) - seed) % 1000000;
+      if (lastStep >= span) {
+        return {
+          'success': false,
+          'message': 'Could not find unused QR codes. Please try again.',
+        };
+      }
       return {
-        'success':      true,
-        'message':      'Equipment added successfully.',
-        'equipment_id': ref.id,
-        'qr_code':      qrCode,
-        'status':       status,
+        'success': true,
+        'units': <Map<String, String>>[
+          for (var i = 0; i < quantity; i++)
+            {'equipment_name': names[i], 'qr_code': codes[i]},
+        ],
       };
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // The codes already in use from <prefix>-<from> through the next [span]
+  // codes, wrapping past 999999. The digits are fixed-width, so text order is
+  // number order and each stretch is a single range query.
+  static Future<Set<String>> _qrCodesInUse(
+      String prefix, int from, int span) async {
+    String code(int n) => '$prefix-${'$n'.padLeft(6, '0')}';
+    final to = from + span - 1;
+    final stretches = to <= 999999
+        ? [(from, to)]
+        : [(from, 999999), (0, to - 1000000)];
+    final taken = <String>{};
+    for (final (lo, hi) in stretches) {
+      final snap = await _db
+          .collection('equipment')
+          .where('qr_code', isGreaterThanOrEqualTo: code(lo))
+          .where('qr_code', isLessThanOrEqualTo: code(hi))
+          .get();
+      taken.addAll(snap.docs.map((d) => '${d.data()['qr_code']}'));
+    }
+    return taken;
+  }
+
+  // Writes the units planned above, all sharing the details in [data]. Eight
+  // to a batch: each write's rule check reads the caller's staff record twice,
+  // and a batch may make at most 20 such reads. If a batch fails part-way, the
+  // units already saved come back with the error so the caller can say how far
+  // it got.
+  static Future<Map<String, dynamic>> addEquipmentUnits(
+      Map<String, dynamic> data, List<Map<String, String>> units) async {
+    // The condition chosen at registration decides the starting status, so an
+    // item registered as Under Repair / For Disposal is not immediately
+    // borrowable (QA 2026-09-19, M1 — this used to be hard-coded Available).
+    // 'Borrowed' is never a valid starting status: a brand-new item is not on
+    // loan, so anything unrecognised falls back to Available.
+    final condition = (data['condition'] as String?)?.trim() ?? '';
+    final requested = (data['status'] as String?)?.trim() ?? '';
+    final status = kStatuses.contains(requested) && requested != 'Borrowed'
+        ? requested
+        : equipmentStatusForCondition(condition);
+    final saved = <Map<String, dynamic>>[];
+    try {
+      for (var i = 0; i < units.length; i += 8) {
+        final batch = _db.batch();
+        final part = <Map<String, dynamic>>[];
+        for (final unit in units.skip(i).take(8)) {
+          final ref = _db.collection('equipment').doc();
+          batch.set(ref, {
+            'equipment_name': unit['equipment_name'],
+            'category':       data['category'],
+            'location':       data['location'] ?? '',
+            'qr_code':        unit['qr_code'],
+            'status':         status,
+            if (condition.isNotEmpty) 'condition': condition,
+            'courses':        (data['courses'] as List?)?.cast<String>() ?? [],
+            'description':    data['description'] ?? '',
+            'brand':          data['brand'] ?? '',
+            'model':          data['model'] ?? '',
+            'serial_number':  data['serial_number'] ?? '',
+            // The lab's Item Identification Number and acquisition date, as on
+            // the custodian's inventory sheet (prof's comment, 2026-10-05). One
+            // sheet line covers the whole lot, so every unit gets the same.
+            'iin':            (data['iin'] as String?)?.trim() ?? '',
+            if (data['date_acquired'] is DateTime)
+              'date_acquired': Timestamp.fromDate(data['date_acquired'] as DateTime),
+            // Photos are written separately by saveEquipmentPhotos once the
+            // documents exist and their ids are known.
+            'created_at':     FieldValue.serverTimestamp(),
+            // Who added it, shown with the date added.
+            'created_by':      Session.staffId,
+            'created_by_name': Session.name,
+          });
+          part.add({...unit, 'equipment_id': ref.id});
+        }
+        await batch.commit();
+        saved.addAll(part);
+      }
+      return {'success': true, 'units': saved, 'status': status};
+    } catch (e) {
+      return {
+        'success': false,
+        'units':   saved,
+        'status':  status,
+        'message': friendlyError(e),
+      };
     }
   }
 
@@ -594,7 +759,14 @@ class ApiService {
           };
         }
       }
-      await _db.collection('equipment').doc(equipmentId).update(data);
+      // Screens hand over a DateTime (or null to clear it); Firestore stores
+      // a Timestamp.
+      final fields = Map<String, dynamic>.from(data);
+      final acquired = fields['date_acquired'];
+      if (acquired is DateTime) {
+        fields['date_acquired'] = Timestamp.fromDate(acquired);
+      }
+      await _db.collection('equipment').doc(equipmentId).update(fields);
       return {'success': true};
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
@@ -661,20 +833,31 @@ class ApiService {
   // or a message explaining what went wrong — a silent failure here would
   // leave equipment with no photo and give staff no hint of it.
   static Future<({Uint8List? thumb, String? error})> saveEquipmentPhoto(
-      String equipmentId, Uint8List raw) async {
+          String equipmentId, Uint8List raw) =>
+      saveEquipmentPhotos([equipmentId], raw);
+
+  // The same photo on several records: the units of one registration share
+  // it. Encoded once, then written four units to a batch (two writes each, and
+  // each write's rule check makes two of the 20 reads a batch allows).
+  static Future<({Uint8List? thumb, String? error})> saveEquipmentPhotos(
+      List<String> equipmentIds, Uint8List raw) async {
     try {
       final encoded = await compute(_encodePhoto, raw);
       if (encoded == null) {
         return (thumb: null, error: 'That image could not be read.');
       }
-      await _db.collection('equipment_photos').doc(equipmentId).set({
-        'image':      Blob(encoded.full),
-        'updated_at': FieldValue.serverTimestamp(),
-      });
-      await _db
-          .collection('equipment')
-          .doc(equipmentId)
-          .update({'photo_thumb': Blob(encoded.thumb)});
+      for (var i = 0; i < equipmentIds.length; i += 4) {
+        final batch = _db.batch();
+        for (final id in equipmentIds.skip(i).take(4)) {
+          batch.set(_db.collection('equipment_photos').doc(id), {
+            'image':      Blob(encoded.full),
+            'updated_at': FieldValue.serverTimestamp(),
+          });
+          batch.update(_db.collection('equipment').doc(id),
+              {'photo_thumb': Blob(encoded.thumb)});
+        }
+        await batch.commit();
+      }
       return (thumb: encoded.thumb, error: null);
     } catch (e) {
       return (thumb: null, error: friendlyError(e));
@@ -691,14 +874,117 @@ class ApiService {
   }
 
   // ── Borrow / Return ───────────────────────────────────────────────────────
+  // ── Borrowing by item type ────────────────────────────────────────────────
+  // Students ask for an item TYPE and a quantity ("Beaker 1000 mL × 2"); the
+  // app picks the units. These helpers are public and pure so they are
+  // unit-testable (see test/).
+
+  // "Beaker 1000 mL #3" → "Beaker 1000 mL". A name without a unit number is
+  // a type of its own. A trailing "#<number>" is ALWAYS read as a unit number
+  // (Register Equipment and the import name units that way), so a size must
+  // not be written like one: "Sieve No. 200", not a lone "Sieve #200". The
+  // lab's sheet already keeps sizes in their own column (checked 2026-10-05).
+  static String baseNameOf(String name) =>
+      name.trim().replaceFirst(RegExp(r'\s+#\d+$'), '');
+
+  // The unit number in "Beaker 1000 mL #3" (3), or 0 for an unnumbered name.
+  static int unitNumberOf(String name) {
+    final m = RegExp(r'#(\d+)$').firstMatch(name.trim());
+    return m == null ? 0 : int.parse(m.group(1)!);
+  }
+
+  // Which [quantity] units of one type to reserve: Available ones only, the
+  // unit the student was looking at ([preferId]) first, then by unit number.
+  // Returns fewer than asked when not enough are free.
+  static List<Map<String, dynamic>> pickUnits(
+      List<Map<String, dynamic>> units, int quantity, {String preferId = ''}) {
+    final free = units.where((u) => u['status'] == 'Available').toList()
+      ..sort((a, b) {
+        final ap = preferId.isNotEmpty && '${a['equipment_id']}' == preferId ? 0 : 1;
+        final bp = preferId.isNotEmpty && '${b['equipment_id']}' == preferId ? 0 : 1;
+        if (ap != bp) return ap.compareTo(bp);
+        return unitNumberOf('${a['equipment_name']}')
+            .compareTo(unitNumberOf('${b['equipment_name']}'));
+      });
+    return free.take(quantity).toList();
+  }
+
+  // The records of one request share their student and their server-stamped
+  // borrow_date (they are written in one batch). Older one-item requests are
+  // simply requests of one.
+  static String requestKey(dynamic t) => '${t['student_id']}|${t['borrow_date']}';
+
+  // [txns] grouped into requests, in order of first appearance (the lists
+  // arrive newest first).
+  static List<List<dynamic>> groupRequests(List<dynamic> txns) {
+    final groups = <String, List<dynamic>>{};
+    for (final t in txns) {
+      groups.putIfAbsent(requestKey(t), () => []).add(t);
+    }
+    return groups.values.toList();
+  }
+
+  // "Beaker 1000 mL × 2, Flask 500 mL" for a request's records (or units).
+  static String requestSummary(List<dynamic> records) {
+    final counts = <String, int>{};
+    for (final t in records) {
+      final base = baseNameOf('${t['equipment_name'] ?? 'Equipment'}');
+      counts[base] = (counts[base] ?? 0) + 1;
+    }
+    return counts.entries
+        .map((e) => e.value > 1 ? '${e.key} × ${e.value}' : e.key)
+        .join(', ');
+  }
+
+  // The item types a student can borrow right now, for the borrow form's
+  // picker: every Available unit, grouped by type, with how many are free.
+  // One read per available unit. At the lab's size (90 units on 2026-10-05)
+  // that is simpler than paging a grouped list; if the inventory grows into
+  // the thousands, keep a per-type count instead.
+  static Future<List<Map<String, dynamic>>> getAvailableTypes() async {
+    final snap = await _db
+        .collection('equipment')
+        .where('status', isEqualTo: 'Available')
+        .get();
+    final types = <String, Map<String, dynamic>>{};
+    for (final d in snap.docs) {
+      final data = d.data();
+      final base = baseNameOf('${data['equipment_name'] ?? ''}');
+      if (base.isEmpty) continue;
+      final t = types.putIfAbsent(base, () => {
+            'name':     base,
+            'category': data['category'] ?? '',
+            'count':    0,
+          });
+      t['count'] = (t['count'] as int) + 1;
+      // The first unit with a photo stands for the type.
+      if (t['photo_thumb'] == null && data['photo_thumb'] != null) {
+        t['photo_thumb'] = data['photo_thumb'];
+      }
+    }
+    return types.values.toList()
+      ..sort((a, b) =>
+          '${a['name']}'.toLowerCase().compareTo('${b['name']}'.toLowerCase()));
+  }
+
+  // A borrow request: one or more item types, each with a quantity. Each unit
+  // reserved becomes its own borrow_transactions record (a loan, a return scan
+  // and a damage report are each about one unit), and all of them are written
+  // in ONE batch, so they share the server-stamped borrow_date. That shared
+  // timestamp, with the student, is what groups them back into one request on
+  // the student and staff screens (see requestKey) — no new field, so the
+  // security rules are unchanged.
+  //
+  // Students used to pick one numbered unit and a quantity that reserved
+  // nothing: "Qty 3" on Beaker #1 left #2 and #3 Available while they were
+  // physically out (prof's comment on a confusing flow, 2026-10-05).
   static Future<Map<String, dynamic>> borrowEquipment(
-      Map<String, dynamic> data) async {
+      Map<String, dynamic> data, List<BorrowLine> lines) async {
     try {
-      final equipId = data['equipment_id'].toString();
-      final sid     = data['student_id'].toString();
+      final sid = data['student_id'].toString();
 
       // Read the student profile once — used for both the hold gate and the
-      // program/course restriction below.
+      // identity fields written below.
       Map<String, dynamic>? stuData;
       if (sid.isNotEmpty) {
         final stuDoc = await _db.collection('students').doc(sid).get();
@@ -718,18 +1004,26 @@ class ApiService {
         };
       }
 
+      // The student's own records, read once for both the overdue gate and the
+      // duplicate check below (these used to be two identical queries).
+      final mine = sid.isEmpty
+          ? <Map<String, dynamic>>[]
+          : (await _db
+                  .collection('borrow_transactions')
+                  .where('student_id', isEqualTo: sid)
+                  .get())
+              .docs
+              .map((d) => d.data())
+              .toList();
+
       // ── Overdue gate (QA 2026-09-19, M6) ──
       // The Home banner ("…before borrowing again") and the Lab Policies screen
       // ("Late returns lose borrowing privileges") both promise this, but until
       // now only a staff-placed hold blocked anything, so a student could sit
       // on two overdue items and keep borrowing. Holding an item past its due
       // date now closes new loans until it is back.
-      if (sid.isNotEmpty) {
-        final mine = await _db
-            .collection('borrow_transactions')
-            .where('student_id', isEqualTo: sid)
-            .get();
-        final late = overdueLoans(mine.docs.map((d) => d.data()).toList());
+      {
+        final late = overdueLoans(mine);
         if (late.isNotEmpty) {
           final names =
               late.map((t) => '${t['equipment_name'] ?? 'an item'}').toSet();
@@ -748,45 +1042,66 @@ class ApiService {
         }
       }
 
-      // Check equipment is Available
-      final eqDoc = await _db.collection('equipment').doc(equipId).get();
-      if (!eqDoc.exists) {
-        return {'success': false, 'message': 'Equipment not found.'};
+      final wanted = lines.where((l) => l.quantity > 0).toList();
+      if (wanted.isEmpty) {
+        return {'success': false, 'message': 'Add at least one item to borrow.'};
       }
-      final eqData = eqDoc.data() as Map<String, dynamic>;
-      if (eqData['status'] != 'Available') {
+      final total = wanted.fold<int>(0, (n, l) => n + l.quantity);
+      if (total > kMaxUnitsPerRequest) {
         return {
           'success': false,
-          'message': 'Equipment is currently ${eqData['status']}.'
+          'message': 'At most $kMaxUnitsPerRequest items per request. Send '
+              'the rest as a second request.',
         };
       }
 
-      // ── One pending request per item per student (QA 2026-09-19, low #3) ──
+      // ── One pending request per item type per student (QA 2026-09-19,
+      // low #3; per type since 2026-10-05) ──
       // Tapping Submit twice, or coming back to the form later, used to file a
-      // second Pending row for the same item. Staff then saw the same student
-      // queued twice for one physical unit, and approving both is exactly the
-      // double-loan that strands an item (see M5). A student cannot withdraw a
-      // request themselves — the rules only let staff update a transaction —
-      // so the duplicate had to be rejected by hand.
-      if (sid.isNotEmpty) {
-        // Single-field query (no composite index needed); filter in Dart —
-        // the same shape the rest of this file uses.
-        final dupes = await _db
-            .collection('borrow_transactions')
-            .where('student_id', isEqualTo: sid)
-            .get();
-        final pending = dupes.docs.where((d) =>
-            d.data()['status'] == 'Pending' &&
-            '${d.data()['equipment_id']}' == equipId);
-        if (pending.isNotEmpty) {
+      // second Pending request for the same thing, and staff saw the same
+      // student queued twice. A student cannot withdraw a request themselves —
+      // the rules only let staff update a transaction — so the duplicate had to
+      // be rejected by hand.
+      final pendingTypes = mine
+          .where((t) => t['status'] == 'Pending')
+          .map((t) => baseNameOf('${t['equipment_name'] ?? ''}'))
+          .toSet();
+      for (final l in wanted) {
+        if (pendingTypes.contains(l.name)) {
           return {
             'success': false,
             'duplicate': true,
-            'message': 'You already have a pending request for '
-                '${eqData['equipment_name'] ?? 'this item'}. Please wait for '
-                'laboratory staff to act on it.',
+            'message': 'You already have a pending request for ${l.name}. '
+                'Please wait for laboratory staff to act on it.',
           };
         }
+      }
+
+      // Reserve the units: for each type, its Available units, the one the
+      // student was looking at first, then by unit number (pickUnits).
+      final picked = <Map<String, dynamic>>[];
+      for (final l in wanted) {
+        final snap = await _db
+            .collection('equipment')
+            .where('equipment_name', isGreaterThanOrEqualTo: l.name)
+            .where('equipment_name', isLessThan: '${l.name}')
+            .get();
+        final units = [
+          for (final d in snap.docs)
+            if (baseNameOf('${d.data()['equipment_name'] ?? ''}') == l.name)
+              {...d.data(), 'equipment_id': d.id},
+        ];
+        final chosen = pickUnits(units, l.quantity, preferId: l.preferId);
+        if (chosen.length < l.quantity) {
+          return {
+            'success': false,
+            'message': chosen.isEmpty
+                ? '${l.name} is no longer available.'
+                : 'Only ${chosen.length} ${l.name} available right now. '
+                    'Lower the quantity, or try again later.',
+          };
+        }
+        picked.addAll(chosen);
       }
 
       // NOTE (2026-09-20): the program/course restriction that used to sit here
@@ -806,35 +1121,57 @@ class ApiService {
       final dueDate =
           computeDueDate(now, DateTime.tryParse('${data['due_date'] ?? ''}'));
 
-      final ref = await _db.collection('borrow_transactions').add({
-        'student_id':     sid,
-        'equipment_id':   equipId,
-        'equipment_name': eqData['equipment_name'],
-        'qr_code':        eqData['qr_code'],
-        // Thumbnail copied onto the transaction so the borrower's list shows
-        // the photo without a second read per row, and keeps showing the item
-        // as it looked when borrowed. ~8 KB.
-        if (eqData['photo_thumb'] != null) 'photo_thumb': eqData['photo_thumb'],
-        'category':       eqData['category'] ?? '',
-        // Identity comes from the student's own profile, never from form
-        // input: staff read these on every request, penalty and hold screen,
-        // and a typed-in name/ID let a student file under a forged identity
-        // (QA 2026-09-19, H5). The form values are only a fallback for a
-        // profile that could not be read.
-        'borrower_name':  stuData?['name'] ?? data['borrower_name'] ?? '',
-        'student_number': stuData?['student_number'] ?? data['student_number'] ?? '',
-        'subject':        data['subject'] ?? '',
-        'quantity':       data['quantity'] ?? 1,
-        'purpose':        data['purpose'] ?? '',
-        'borrow_date':    FieldValue.serverTimestamp(),
-        'due_date':       Timestamp.fromDate(dueDate),
-        'return_date':    null,
-        'status':         'Pending',
-      });
+      // One batch: every record gets the same borrow_date, which is what ties
+      // them together as one request. At most kMaxUnitsPerRequest writes, each
+      // checked by the rules with two document reads (the student's profile
+      // and the unit), inside a batch's limit of 20.
+      final batch = _db.batch();
+      for (final u in picked) {
+        batch.set(_db.collection('borrow_transactions').doc(), {
+          'student_id':     sid,
+          'equipment_id':   u['equipment_id'],
+          'equipment_name': u['equipment_name'],
+          'qr_code':        u['qr_code'],
+          // Thumbnail copied onto the transaction so the borrower's list shows
+          // the photo without a second read per row, and keeps showing the
+          // item as it looked when borrowed. ~8 KB.
+          if (u['photo_thumb'] != null) 'photo_thumb': u['photo_thumb'],
+          'category':       u['category'] ?? '',
+          // Identity comes from the student's own profile, never from form
+          // input: staff read these on every request, penalty and hold screen,
+          // and a typed-in name/ID let a student file under a forged identity
+          // (QA 2026-09-19, H5). The form values are only a fallback for a
+          // profile that could not be read.
+          'borrower_name':  stuData?['name'] ?? data['borrower_name'] ?? '',
+          'student_number': stuData?['student_number'] ?? data['student_number'] ?? '',
+          'subject':        data['subject'] ?? '',
+          // One unit per record; the request's size is how many records
+          // share its borrow_date.
+          'quantity':       1,
+          'purpose':        data['purpose'] ?? '',
+          'borrow_date':    FieldValue.serverTimestamp(),
+          'due_date':       Timestamp.fromDate(dueDate),
+          'return_date':    null,
+          'status':         'Pending',
+        });
+      }
+      try {
+        await batch.commit();
+      } on FirebaseException catch (e) {
+        if (e.code != 'permission-denied') rethrow;
+        // The rules re-check that every unit is still Available, so the
+        // usual cause is someone else taking one in the last few seconds.
+        return {
+          'success': false,
+          'message': 'The request was refused. One of the items may have '
+              'just been taken. Please try again.',
+        };
+      }
       return {
-        'success':        true,
-        'message':        'Borrow request submitted successfully.',
-        'transaction_id': ref.id,
+        'success': true,
+        'message': 'Borrow request submitted successfully.',
+        'count':   picked.length,
+        'summary': requestSummary(picked),
       };
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
@@ -967,6 +1304,15 @@ class ApiService {
   }
 
   // ── Transactions ──────────────────────────────────────────────────────────
+  // A stored date as an ISO-8601 string, or '' when the field is missing or is
+  // not a Timestamp. Every list maps all of its documents through this, and the
+  // old `as Timestamp?` cast threw on a value of any other type — one such
+  // record stopped the whole list from loading (QA 2026-10-03). The rules now
+  // refuse those values on create; this keeps any that exist from doing harm.
+  // Public and pure so it is unit-testable (see test/).
+  static String isoDate(dynamic v) =>
+      v is Timestamp ? v.toDate().toIso8601String() : '';
+
   // Shared doc → map conversion for borrow transactions (timestamps to ISO
   // strings, doc id in, newest first). Used by both the one-shot getters and
   // the live streams below.
@@ -977,14 +1323,8 @@ class ApiService {
       return {
         ...data,
         'transaction_id': d.id,
-        'due_date': (data['due_date'] as Timestamp?)
-                ?.toDate()
-                .toIso8601String() ??
-            '',
-        'borrow_date': (data['borrow_date'] as Timestamp?)
-                ?.toDate()
-                .toIso8601String() ??
-            '',
+        'due_date':    isoDate(data['due_date']),
+        'borrow_date': isoDate(data['borrow_date']),
       };
     }).toList();
 
@@ -1060,7 +1400,8 @@ class ApiService {
 
     return (
       stats: {
-        'pending_requests':    pending.length,
+        // Requests, not records: one request can hold several units.
+        'pending_requests':    groupRequests(pending).length,
         'active_loans':        approved.length,
         'overdue_loans':       overdue,
         'total_equipment':     equip.total,
@@ -1096,20 +1437,71 @@ class ApiService {
   // Firestore pushes changes as they happen, so screens built on these update
   // by themselves — a student sees an approval the moment staff taps it, with
   // no pull-to-refresh.
+  //
+  // Every live stream goes through _untilSignOut, so signOut() can end them all
+  // before the account goes away. A closed stream simply stops: the screen
+  // keeps its last data until the login page replaces it.
+  static final Set<Future<void> Function()> _liveStreams = {};
+
+  static Stream<T> _untilSignOut<T>(Stream<T> source) {
+    late final StreamController<T> out;
+    StreamSubscription<T>? sub;
+    Future<void> close() async {
+      _liveStreams.remove(close);
+      final s = sub;
+      sub = null;
+      await s?.cancel();
+      if (!out.isClosed) await out.close();
+    }
+
+    out = StreamController<T>(
+      onListen: () {
+        _liveStreams.add(close);
+        sub = source.listen(out.add, onError: out.addError, onDone: close);
+      },
+      onCancel: close,
+    );
+    return out.stream;
+  }
+
+  static Future<void> _closeLiveStreams() async {
+    final live = _liveStreams.toList();
+    _liveStreams.clear();
+    await Future.wait(live.map((close) => close()));
+  }
+
   static Stream<List<dynamic>> myBorrowingsStream() {
     final sid = Session.currentUser?['student_id']?.toString() ?? '';
     if (sid.isEmpty) return Stream.value(const []);
-    return _db
+    return _untilSignOut(_db
         .collection('borrow_transactions')
         .where('student_id', isEqualTo: sid)
         .snapshots()
-        .map((snap) => _mapTransactionDocs(snap.docs));
+        .map((snap) => _mapTransactionDocs(snap.docs)));
   }
 
-  static Stream<List<dynamic>> requestsStream() => _db
+  // The staff Requests tab's Pending and Approved lists: naturally small, so
+  // they are listened to directly. This used to listen to the WHOLE
+  // borrow_transactions collection, which grows forever; after a busy
+  // semester every open of the tab would have cost thousands of reads against
+  // the free plan's 50,000 a day.
+  static Stream<List<dynamic>> requestsStream() => _untilSignOut(_db
       .collection('borrow_transactions')
+      .where('status', whereIn: ['Pending', 'Approved'])
       .snapshots()
-      .map((snap) => _mapTransactionDocs(snap.docs));
+      .map((snap) => _mapTransactionDocs(snap.docs)));
+
+  // The Requests tab's "All" list: everything from the last [days] days, the
+  // same window as Reports. A single-field inequality, so Firestore's
+  // automatic index covers it.
+  static Stream<List<dynamic>> recentRequestsStream({int days = 90}) {
+    final cutoff = DateTime.now().subtract(Duration(days: days));
+    return _untilSignOut(_db
+        .collection('borrow_transactions')
+        .where('borrow_date', isGreaterThanOrEqualTo: Timestamp.fromDate(cutoff))
+        .snapshots()
+        .map((snap) => _mapTransactionDocs(snap.docs)));
+  }
 
   // Approve or reject a borrow request. Runs in a transaction so that, on
   // approval, the equipment is only locked to Borrowed if it is still Available
@@ -1156,6 +1548,10 @@ class ApiService {
           if (eqStatus != 'Available') {
             return {
               'success': false,
+              // approveRequest() takes this as its cue to offer the request
+              // another free unit of the same type.
+              'unavailable': true,
+              'equipment_name': txData['equipment_name'] ?? '',
               'message':
                   'Equipment is no longer available (${eqStatus ?? 'missing'}).'
             };
@@ -1183,6 +1579,114 @@ class ApiService {
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
     }
+  }
+
+  // Approve one record of a request. If the unit it reserved was taken
+  // meanwhile (two students can ask for the same type at once, and a student
+  // cannot see the other's pending request), approve it with another free
+  // unit of the same type instead of failing: the student asked for "a
+  // beaker", not for beaker #1.
+  static Future<Map<String, dynamic>> approveRequest(String txId) async {
+    final first = await updateRequestStatus(txId, 'approve');
+    if (first['success'] == true || first['unavailable'] != true) return first;
+    try {
+      final base = baseNameOf('${first['equipment_name'] ?? ''}');
+      if (base.isEmpty) return first;
+      final snap = await _db
+          .collection('equipment')
+          .where('equipment_name', isGreaterThanOrEqualTo: base)
+          .where('equipment_name', isLessThan: '$base')
+          .get();
+      final candidates = pickUnits([
+        for (final d in snap.docs)
+          if (baseNameOf('${d.data()['equipment_name'] ?? ''}') == base)
+            {...d.data(), 'equipment_id': d.id},
+      ], snap.docs.length);
+      for (final unit in candidates) {
+        final res = await _approveAs(txId, unit);
+        // Done, or another staff member decided it meanwhile.
+        if (res['success'] == true || res['retry'] != true) return res;
+      }
+      return {
+        'success': false,
+        'message': 'No $base is available any more. Reject the request, or '
+            'approve it once one is returned.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // Approve record [txId] with [unit] in place of the unit it reserved, in one
+  // transaction: still Pending, and the new unit still Available.
+  static Future<Map<String, dynamic>> _approveAs(
+      String txId, Map<String, dynamic> unit) {
+    final txRef = _db.collection('borrow_transactions').doc(txId);
+    final eqRef = _db.collection('equipment').doc('${unit['equipment_id']}');
+    return _db.runTransaction((tx) async {
+      final txDoc = await tx.get(txRef);
+      final txData = txDoc.data();
+      if (txData == null) {
+        return {'success': false, 'message': 'Transaction not found.'};
+      }
+      if (txData['status'] != 'Pending') {
+        return {
+          'success': false,
+          'already_decided': true,
+          'message': 'This request was already ${'${txData['status']}'.toLowerCase()}.',
+        };
+      }
+      final eqDoc = await tx.get(eqRef);
+      if (eqDoc.data()?['status'] != 'Available') {
+        return {'success': false, 'retry': true};
+      }
+      final e = eqDoc.data()!;
+      tx.update(txRef, {
+        'equipment_id':   eqRef.id,
+        'equipment_name': e['equipment_name'],
+        'qr_code':        e['qr_code'],
+        'category':       e['category'] ?? '',
+        'photo_thumb':    e['photo_thumb'] ?? FieldValue.delete(),
+        'status':           'Approved',
+        'approved_by':      Session.staffId,
+        'approved_by_name': Session.name,
+        'approved_at':      FieldValue.serverTimestamp(),
+      });
+      tx.update(eqRef, {'status': 'Borrowed'});
+      return {
+        'success': true,
+        'message': 'Approved with ${e['equipment_name']} (the unit first '
+            'reserved was taken).',
+      };
+    });
+  }
+
+  // Approve or reject every record of one request. Returns how many went
+  // through and the first refusal, if any.
+  static Future<Map<String, dynamic>> decideRequest(
+      List<String> txIds, String action, {String reason = ''}) async {
+    var done = 0;
+    String? firstError;
+    for (final id in txIds) {
+      final res = action == 'approve'
+          ? await approveRequest(id)
+          : await updateRequestStatus(id, 'reject', reason: reason);
+      if (res['success'] == true) {
+        done++;
+      } else {
+        firstError ??= '${res['message'] ?? 'Action failed.'}';
+      }
+    }
+    return {
+      'success': firstError == null,
+      'done':    done,
+      'total':   txIds.length,
+      'message': firstError == null
+          ? null
+          : done == 0
+              ? firstError
+              : '$done of ${txIds.length} done. $firstError',
+    };
   }
 
   // ── Damage Report ─────────────────────────────────────────────────────────
@@ -1213,10 +1717,7 @@ class ApiService {
       return {
         ...data,
         'report_id': d.id,
-        'reported_at': (data['reported_at'] as Timestamp?)
-                ?.toDate()
-                .toIso8601String() ??
-            '',
+        'reported_at': isoDate(data['reported_at']),
       };
     }).where((r) {
       if (status.isEmpty || status == 'All') return true;
@@ -1526,12 +2027,13 @@ class ApiService {
   // for as long as the session lasts. Null means the server confirmed the
   // document is gone; a "missing" served from the offline cache proves
   // nothing, so it is skipped rather than reported.
-  static Stream<Map<String, dynamic>?> staffSelfStream(String staffId) => _db
-      .collection('staff')
-      .doc(staffId)
-      .snapshots()
-      .where((s) => s.exists || !s.metadata.isFromCache)
-      .map((s) => s.exists ? s.data() : null);
+  static Stream<Map<String, dynamic>?> staffSelfStream(String staffId) =>
+      _untilSignOut(_db
+          .collection('staff')
+          .doc(staffId)
+          .snapshots()
+          .where((s) => s.exists || !s.metadata.isFromCache)
+          .map((s) => s.exists ? s.data() : null));
 
   // A superadmin editing ANOTHER staff member: display name, access level, or
   // both. The rules refuse it for everyone else, and refuse it on your own

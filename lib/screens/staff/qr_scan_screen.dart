@@ -2,6 +2,8 @@
 // LabTrack - staff: qr scan screen
 //
 // Extracted from firstFile.dart on 2026-08-03 as step 7 of the module split.
+// The return sheet and the damage follow-up moved to return_flow.dart on
+// 2026-10-05, so the Dashboard's "Mark as Returned" can use the same step.
 // -----------------------------------------------------------------------------
 
 
@@ -10,7 +12,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 
 import '../../services/api_service.dart';
 import '../../theme.dart';
-import '../../widgets/common.dart';
+import 'return_flow.dart';
 
 // ─── QR Scan Screen (Admin — Return Processing) ───────────────────────────────
 
@@ -66,7 +68,14 @@ class _QRScanScreenState extends State<QRScanScreen> {
       Navigator.pop(context); // close loading
 
       if (res['success'] == true) {
-        _showReturnSheet(res['data'] as Map<String, dynamic>);
+        final equipment = res['data'] as Map<String, dynamic>;
+        await showReturnSheet(
+          context,
+          equipment: equipment,
+          doReturn: (condition) => ApiService.returnEquipmentByQr(
+              '${equipment['equipment_id']}', condition),
+        );
+        if (mounted) setState(() => _scanning = true);
       } else {
         _showNotFound(code);
       }
@@ -75,212 +84,6 @@ class _QRScanScreenState extends State<QRScanScreen> {
       Navigator.pop(context);
       _showError();
     }
-  }
-
-  Future<void> _processReturn(
-      String equipId, String equipName, String condition) async {
-    Navigator.pop(context); // close the return sheet
-    final res = await ApiService.returnEquipmentByQr(equipId, condition);
-    if (!mounted) return;
-    if (res['success'] != true) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(res['message'] ?? 'Failed to process return.'),
-        backgroundColor: AppTheme.danger,
-        behavior: SnackBarBehavior.floating,
-      ));
-      setState(() => _scanning = true);
-      return;
-    }
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(condition == 'Damaged'
-          ? '"$equipName" returned and marked Under Repair.'
-          : '"$equipName" marked as returned.'),
-      backgroundColor:
-          condition == 'Damaged' ? AppTheme.warning : AppTheme.success,
-      behavior: SnackBarBehavior.floating,
-    ));
-    if (condition == 'Damaged') {
-      await _offerDamageFollowUp(res, equipId, equipName);
-    }
-    if (mounted) setState(() => _scanning = true);
-  }
-
-  Future<void> _offerDamageFollowUp(
-      Map<String, dynamic> res, String equipId, String equipName) async {
-    final borrower  = '${res['borrower_name'] ?? 'the student'}';
-    final studentId = '${res['student_id'] ?? ''}';
-    final apply = await showDialog<bool>(
-      context: context,
-      builder: (dCtx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        icon: const Icon(Icons.gpp_maybe_outlined, color: AppTheme.danger, size: 44),
-        title: const Text('Log Damage & Hold?'),
-        content: Text(
-            'Record a damage report for "$equipName" and place a borrowing hold '
-            'on $borrower until it is settled?',
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 13)),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(dCtx, false),
-              child: const Text('Skip', style: TextStyle(color: AppTheme.textMid))),
-          ElevatedButton(
-              onPressed: () => Navigator.pop(dCtx, true),
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.danger),
-              child: const Text('Log & Hold')),
-        ],
-      ),
-    );
-    if (apply != true) return;
-    await ApiService.submitDamageReport({
-      'equipment_id':   equipId,
-      'equipment_name': equipName,
-      'student_id':     studentId,
-      'borrower_name':  res['borrower_name'] ?? '',
-      'student_number': res['student_number'] ?? '',
-      'description':    'Reported damaged on return (staff QR return).',
-      'reported_by':    'staff',
-    });
-    if (studentId.isNotEmpty) {
-      await ApiService.setStudentHold(studentId, true,
-          reason: 'Damaged equipment "$equipName" pending settlement.');
-    }
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('Damage report logged and hold placed.'),
-      backgroundColor: AppTheme.danger,
-      behavior: SnackBarBehavior.floating,
-    ));
-  }
-
-  void _showReturnSheet(Map<String, dynamic> equipment) {
-    final status      = equipment['status'] ?? 'Unknown';
-    final isBorrowed  = status == 'Borrowed';
-    // Not-Borrowed does not mean Available: an item can be Under Repair or
-    // For Disposal. This sheet used to paint the badge green and say "already
-    // Available" for all three. Found on the emulator 2026-09-21 by scanning
-    // an Under Repair item, which reported itself Available.
-    final isAvailable = status == 'Available';
-    final statusColor = isBorrowed
-        ? AppTheme.warning
-        : isAvailable
-            ? AppTheme.success
-            : AppTheme.danger;
-    final equipName   = equipment['equipment_name'] ?? '';
-    final equipId     = '${equipment['equipment_id']}';
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => Container(
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          // Handle
-          Container(width: 40, height: 4,
-              decoration: BoxDecoration(color: AppTheme.divider,
-                  borderRadius: BorderRadius.circular(2))),
-          const SizedBox(height: 20),
-
-          // Equipment info
-          Container(
-            width: 60, height: 60,
-            decoration: BoxDecoration(
-                color: statusColor.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(16)),
-            child: Icon(Icons.science_outlined, color: statusColor, size: 30),
-          ),
-          const SizedBox(height: 12),
-          Text(equipName,
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold,
-                  color: AppTheme.textDark),
-              textAlign: TextAlign.center),
-          const SizedBox(height: 4),
-          Text('${equipment['qr_code']}  •  ${equipment['category']}',
-              style: const TextStyle(fontSize: 13, color: AppTheme.textMid)),
-          const SizedBox(height: 12),
-
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            StatusBadge(label: status, color: statusColor),
-            if (equipment['location'] != null) ...[
-              const SizedBox(width: 8),
-              StatusBadge(label: equipment['location'], color: AppTheme.textMid),
-            ],
-          ]),
-          const SizedBox(height: 24),
-          const Divider(color: AppTheme.divider),
-          const SizedBox(height: 16),
-
-          // Action
-          if (isBorrowed) ...[
-            const Text(
-                'Confirm the student has returned this equipment, then record its condition.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 13, color: AppTheme.textMid)),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: () => _processReturn(equipId, equipName, 'Good'),
-                icon: const Icon(Icons.check_circle_outline_rounded),
-                label: const Text('Return — Good Condition'),
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTheme.success,
-                    padding: const EdgeInsets.symmetric(vertical: 14)),
-              ),
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () => _processReturn(equipId, equipName, 'Damaged'),
-                icon: const Icon(Icons.report_problem_outlined),
-                label: const Text('Return — Report Damage'),
-                style: OutlinedButton.styleFrom(
-                    foregroundColor: AppTheme.warning,
-                    side: const BorderSide(color: AppTheme.warning),
-                    padding: const EdgeInsets.symmetric(vertical: 14)),
-              ),
-            ),
-          ] else ...[
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                  color: statusColor.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(12)),
-              child: Row(children: [
-                Icon(Icons.info_outline_rounded, color: statusColor, size: 18),
-                const SizedBox(width: 10),
-                Expanded(child: Text(
-                  isAvailable
-                      ? 'This equipment is already Available — no return '
-                          'needed.'
-                      : 'This equipment is marked $status and is not out on '
-                          'loan, so there is nothing to return.',
-                  style: const TextStyle(fontSize: 13, color: AppTheme.textDark),
-                )),
-              ]),
-            ),
-          ],
-
-          const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-                setState(() => _scanning = true);
-              },
-              child: const Text('Scan Another'),
-            ),
-          ),
-        ]),
-      ),
-    ).then((_) => setState(() => _scanning = true));
   }
 
   void _showNotFound(String code) {
@@ -455,4 +258,3 @@ class _ScanOverlayPainter extends CustomPainter {
   @override
   bool shouldRepaint(_) => false;
 }
-

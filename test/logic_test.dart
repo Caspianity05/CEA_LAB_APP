@@ -150,7 +150,7 @@ void main() {
 
   // Regression: registration dropped the Condition field, so every item was
   // stored Available — a scope registered For Disposal was immediately
-  // borrowable (QA 2026-09-19, M1). addEquipment now maps through here.
+  // borrowable (QA 2026-09-19, M1). addEquipmentUnits now maps through here.
   group('Registration condition to starting status', () {
     test('Good starts Available', () {
       expect(ApiService.equipmentStatusForCondition('Good'), 'Available');
@@ -163,6 +163,67 @@ void main() {
     });
     test('For Disposal does not start borrowable', () {
       expect(ApiService.equipmentStatusForCondition('For Disposal'), 'For Disposal');
+    });
+  });
+
+  // Register Equipment's Quantity used to be validated and then thrown away,
+  // so a lot of ten flasks became one record. Each unit is now its own record,
+  // named and numbered the way the 2026-10-02 import named them.
+  group('Registration: one numbered record per unit', () {
+    test('a single unit keeps its plain name', () {
+      expect(ApiService.unitNames('Current Meter', 1, const []), ['Current Meter']);
+    });
+    test('several units are numbered from #1', () {
+      expect(ApiService.unitNames('Beaker 250 mL', 3, const []),
+          ['Beaker 250 mL #1', 'Beaker 250 mL #2', 'Beaker 250 mL #3']);
+    });
+    test('numbers are padded to the width of the highest one', () {
+      final names = ApiService.unitNames('Total Station', 10, const []);
+      expect(names.first, 'Total Station #01');
+      expect(names.last, 'Total Station #10');
+      expect(names.length, 10);
+    });
+    test('numbering carries on after the units already there', () {
+      final existing = [for (var i = 1; i <= 9; i++) 'Flask 500 mL #$i'];
+      expect(ApiService.unitNames('Flask 500 mL', 3, existing),
+          ['Flask 500 mL #10', 'Flask 500 mL #11', 'Flask 500 mL #12']);
+    });
+    test('one more unit is numbered when numbered ones exist', () {
+      expect(
+          ApiService.unitNames(
+              'Flask 500 mL', 1, const ['Flask 500 mL #1', 'Flask 500 mL #2']),
+          ['Flask 500 mL #3']);
+    });
+    test('keeps the padding already in use', () {
+      expect(
+          ApiService.unitNames(
+              'Total Station', 2, const ['Total Station #01', 'Total Station #10']),
+          ['Total Station #11', 'Total Station #12']);
+      expect(ApiService.unitNames('Sieve', 1, const ['Sieve #007']), ['Sieve #008']);
+    });
+    test('ignores names that only share a prefix', () {
+      expect(
+          ApiService.unitNames(
+              'Flask', 2, const ['Flask 500 mL #4', 'Flask #2b', 'Flask']),
+          ['Flask #1', 'Flask #2']);
+    });
+  });
+
+  group('Registration: QR codes', () {
+    test('category prefix and six clock digits, one apart per unit', () {
+      expect(ApiService.qrCodesFor('Tools', 3, 1759380137900, {}),
+          ['TOO-137900', 'TOO-137901', 'TOO-137902']);
+    });
+    test('keeps leading zeros', () {
+      expect(ApiService.qrCodesFor('Optics', 1, 1759380000042, {}), ['OPT-000042']);
+    });
+    test('skips codes already in use', () {
+      expect(ApiService.qrCodesFor('Tools', 3, 1759380137900, {'TOO-137901'}),
+          ['TOO-137900', 'TOO-137902', 'TOO-137903']);
+    });
+    test('wraps around after 999999', () {
+      expect(ApiService.qrCodesFor('Other', 2, 1759380999999, {}),
+          ['OTH-999999', 'OTH-000000']);
     });
   });
 
@@ -318,6 +379,25 @@ void main() {
     });
   });
 
+  // Every staff list maps all of its records through isoDate, so it must never
+  // throw: one record holding the wrong type used to stop the whole list from
+  // loading (QA 2026-10-03).
+  group('isoDate', () {
+    test('converts a Timestamp to the ISO string the screens split on', () {
+      final when = DateTime(2026, 10, 3, 9, 30);
+      expect(ApiService.isoDate(Timestamp.fromDate(when)), when.toIso8601String());
+    });
+    test('a missing field is undated', () {
+      expect(ApiService.isoDate(null), '');
+    });
+    test('a value of any other type is undated, not an error', () {
+      expect(ApiService.isoDate('2026-10-03'), '');
+      expect(ApiService.isoDate(42), '');
+      expect(ApiService.isoDate({'seconds': 1}), '');
+      expect(ApiService.isoDate(['x']), '');
+    });
+  });
+
   group('courseLabel', () {
     test('maps known program codes to full names', () {
       expect(courseLabel('CE'), 'Civil Engineering');
@@ -325,6 +405,91 @@ void main() {
     });
     test('falls back to the raw code for unknown values', () {
       expect(courseLabel('BSIT'), 'BSIT');
+    });
+  });
+
+  // Borrowing by item type (prof's comment 2026-10-05: borrowing was
+  // confusing; the Quantity box reserved nothing).
+  group('Borrowing by item type', () {
+    test('baseNameOf strips the unit number only', () {
+      expect(ApiService.baseNameOf('Beaker 1000 mL #3'), 'Beaker 1000 mL');
+      expect(ApiService.baseNameOf('Total Station #01'), 'Total Station');
+      expect(ApiService.baseNameOf('Current Meter'), 'Current Meter');
+      // A '#' that is not a trailing unit number stays.
+      expect(ApiService.baseNameOf('Sieve #200 mesh'), 'Sieve #200 mesh');
+    });
+
+    test('unitNumberOf reads the trailing number', () {
+      expect(ApiService.unitNumberOf('Flask 500 mL #10'), 10);
+      expect(ApiService.unitNumberOf('Total Station #01'), 1);
+      expect(ApiService.unitNumberOf('Current Meter'), 0);
+    });
+
+    Map<String, dynamic> unit(String id, String name, String status) =>
+        {'equipment_id': id, 'equipment_name': name, 'status': status};
+    final beakers = [
+      unit('b3', 'Beaker 1000 mL #3', 'Available'),
+      unit('b1', 'Beaker 1000 mL #1', 'Borrowed'),
+      unit('b10', 'Beaker 1000 mL #10', 'Available'),
+      unit('b2', 'Beaker 1000 mL #2', 'Available'),
+      unit('b4', 'Beaker 1000 mL #4', 'Under Repair'),
+    ];
+
+    test('pickUnits takes free units in number order', () {
+      final got = ApiService.pickUnits(beakers, 2);
+      expect(got.map((u) => u['equipment_id']), ['b2', 'b3']);
+    });
+
+    test('pickUnits puts the unit the student looked at first', () {
+      final got = ApiService.pickUnits(beakers, 2, preferId: 'b10');
+      expect(got.map((u) => u['equipment_id']), ['b10', 'b2']);
+    });
+
+    test('pickUnits ignores a preferred unit that is not free', () {
+      final got = ApiService.pickUnits(beakers, 1, preferId: 'b1');
+      expect(got.map((u) => u['equipment_id']), ['b2']);
+    });
+
+    test('pickUnits returns fewer when not enough are free', () {
+      expect(ApiService.pickUnits(beakers, 5).length, 3);
+    });
+
+    test('records of one submit group into one request', () {
+      final t = [
+        {'student_id': 's1', 'borrow_date': '2026-10-05T15:21:00.000', 'equipment_name': 'Beaker 1000 mL #1'},
+        {'student_id': 's1', 'borrow_date': '2026-10-05T15:21:00.000', 'equipment_name': 'Beaker 1000 mL #2'},
+        {'student_id': 's2', 'borrow_date': '2026-10-05T15:21:00.000', 'equipment_name': 'Flask 500 mL #1'},
+        {'student_id': 's1', 'borrow_date': '2026-10-04T09:00:00.000', 'equipment_name': 'Rubber Mallet #1'},
+      ];
+      final groups = ApiService.groupRequests(t);
+      expect(groups.length, 3);
+      expect(groups.first.length, 2);
+      expect(ApiService.requestSummary(groups.first), 'Beaker 1000 mL × 2');
+    });
+
+    test('requestSummary lists each type once, with its count', () {
+      final records = [
+        {'equipment_name': 'Beaker 1000 mL #1'},
+        {'equipment_name': 'Flask 500 mL #4'},
+        {'equipment_name': 'Beaker 1000 mL #2'},
+      ];
+      expect(ApiService.requestSummary(records), 'Beaker 1000 mL × 2, Flask 500 mL');
+    });
+  });
+
+  // Equipment dates (date acquired / date added), prof's comment 2026-10-05.
+  group('formatDate', () {
+    test('writes month name, day, year', () {
+      expect(formatDate(DateTime(1992, 5, 6)), 'May 6, 1992');
+      expect(formatDate(DateTime(2026, 10, 2, 14, 30)), 'Oct 2, 2026');
+    });
+    test('covers the first and last months', () {
+      expect(formatDate(DateTime(1991, 1, 18)), 'Jan 18, 1991');
+      expect(formatDate(DateTime(2025, 12, 31)), 'Dec 31, 2025');
+    });
+    test('reads a stored Timestamp the same way, via asDate', () {
+      final ts = Timestamp.fromDate(DateTime(1991, 7, 18));
+      expect(formatDate(ApiService.asDate(ts)!), 'Jul 18, 1991');
     });
   });
 

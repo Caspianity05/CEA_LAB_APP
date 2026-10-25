@@ -14,6 +14,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
+import '../constants.dart';
 import '../theme.dart';
 
 // ─── Shared Widgets ───────────────────────────────────────────────────────────
@@ -353,6 +354,52 @@ class DetailRow extends StatelessWidget {
                   fontWeight: FontWeight.w600,
                   color: AppTheme.textDark)),
         ],
+      ),
+    );
+  }
+}
+
+// A tap-to-pick calendar date that may stay empty, e.g. an equipment's date
+// acquired, which the lab's records often do not have. Past dates only; the
+// clear button sets it back to empty. Used by Register Equipment and
+// Inventory → Edit.
+class DateField extends StatelessWidget {
+  final DateTime? value;
+  final ValueChanged<DateTime?> onChanged;
+  final String hint;
+  const DateField(
+      {super.key, required this.value, required this.onChanged, this.hint = 'Unknown'});
+
+  @override
+  Widget build(BuildContext context) {
+    final v = value;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () async {
+        final now = DateTime.now();
+        final picked = await showDatePicker(
+          context: context,
+          initialDate: v != null && v.isBefore(now) ? v : now,
+          firstDate: DateTime(1950),
+          lastDate: now,
+        );
+        if (picked != null) onChanged(picked);
+      },
+      child: InputDecorator(
+        decoration: InputDecoration(
+          prefixIcon: const Icon(Icons.event_outlined, color: AppTheme.textMid),
+          suffixIcon: v == null
+              ? null
+              : IconButton(
+                  tooltip: 'Clear date',
+                  icon: const Icon(Icons.close_rounded, size: 18, color: AppTheme.textMid),
+                  onPressed: () => onChanged(null),
+                ),
+        ),
+        child: Text(v == null ? hint : formatDate(v),
+            style: TextStyle(
+                fontSize: 14,
+                color: v == null ? AppTheme.textLight : AppTheme.textDark)),
       ),
     );
   }

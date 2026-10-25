@@ -24,6 +24,10 @@ class EquipmentCatalogScreen extends StatefulWidget {
 
 class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
   String _search = '';
+  // Keeps the typed text on screen when a reload swaps the body for a
+  // spinner; otherwise the box came back empty while _search still filtered
+  // (same fault as staff Inventory, 2026-10-05).
+  final _searchCtrl = TextEditingController();
   final Set<String> _selectedCategories = {};
   final _categories = kCategories;
   bool _dropdownOpen = false;
@@ -51,6 +55,7 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
   void dispose() {
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
@@ -215,6 +220,7 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
               children: [
                 // Search bar
                 TextField(
+                  controller: _searchCtrl,
                   onChanged: (v) => setState(() => _search = v),
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(

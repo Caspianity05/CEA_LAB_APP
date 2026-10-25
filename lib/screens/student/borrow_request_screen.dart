@@ -2,119 +2,73 @@
 // LabTrack - student: borrow request screen
 //
 // Extracted from firstFile.dart on 2026-08-03 as step 6 of the module split.
+//
+// Reworked 2026-10-05 after the prof's comments ("the flow of borrowing is a
+// bit confusing", "less inputs for the students"):
+//   • the student picks item TYPES and how many of each ("Beaker 1000 mL × 2"),
+//     not one numbered unit; the app reserves the units (ApiService
+//     .borrowEquipment). The old Quantity box reserved nothing.
+//   • the Borrow Time picker is gone: it was never saved (the borrow time is
+//     when the request is sent), it only made the form longer;
+//   • name and student ID are one read-only line instead of two locked fields;
+//   • subject and purpose stay optional.
 // -----------------------------------------------------------------------------
 
-import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'dart:typed_data';
 
+import 'package:flutter/material.dart';
+
+import '../../constants.dart';
 import '../../services/api_service.dart';
 import '../../services/session.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
 import 'lab_policies_screen.dart';
 
-// ─── Equipment Picker Sheet ───────────────────────────────────────────────────
-// Bottom sheet behind the borrow form's equipment field. Pages through the
-// collection (see ApiService.getEquipmentPage) rather than reading all of it,
-// and pops with the chosen record.
+// ─── Item Type Picker Sheet ───────────────────────────────────────────────────
+// Bottom sheet behind "Add equipment": every item type with at least one
+// Available unit, how many are free, and a search box. Pops with the chosen
+// type ({name, category, count, photo_thumb}).
 
-class _EquipmentPickerSheet extends StatefulWidget {
-  final String selectedId;
-  const _EquipmentPickerSheet({required this.selectedId});
+class _TypePickerSheet extends StatefulWidget {
+  final Set<String> alreadyAdded;
+  const _TypePickerSheet({required this.alreadyAdded});
   @override
-  State<_EquipmentPickerSheet> createState() => _EquipmentPickerSheetState();
+  State<_TypePickerSheet> createState() => _TypePickerSheetState();
 }
 
-class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
-  static const int _pageSize = 20;
-  final _scrollController = ScrollController();
-  final List<Map<String, dynamic>> _items = [];
-  DocumentSnapshot? _cursor;
-  bool _loading     = true;
-  bool _loadingMore = false;
-  bool _hasMore     = true;
-  bool _failed      = false;
+class _TypePickerSheetState extends State<_TypePickerSheet> {
+  List<Map<String, dynamic>> _types = [];
+  bool _loading = true;
+  bool _failed  = false;
+  final _searchCtrl = TextEditingController();
+  String _search = '';
 
   @override
   void initState() {
     super.initState();
-    _scrollController.addListener(_onScroll);
-    _loadMore();
+    ApiService.getAvailableTypes().then((types) {
+      if (mounted) setState(() { _types = types; _loading = false; });
+    }).catchError((_) {
+      if (mounted) setState(() { _failed = true; _loading = false; });
+    });
   }
 
   @override
   void dispose() {
-    _scrollController.removeListener(_onScroll);
-    _scrollController.dispose();
+    _searchCtrl.dispose();
     super.dispose();
-  }
-
-  void _onScroll() {
-    if (!_scrollController.hasClients) return;
-    final pos = _scrollController.position;
-    if (pos.pixels >= pos.maxScrollExtent - 300) _loadMore();
-  }
-
-  // Only 'Available' equipment is offered. That filter runs on the client,
-  // because combining it with the name ordering server-side would need a
-  // composite index (see the TODO in _AdminInventoryScreenState), so a page
-  // can arrive with nothing to show — build() keeps pulling until it does.
-  Future<void> _loadMore() async {
-    if (_loadingMore || !_hasMore) return;
-    _loadingMore = true;
-    try {
-      final page = await ApiService.getEquipmentPage(
-          limit: _pageSize, startAfter: _cursor);
-      if (!mounted) return;
-      setState(() {
-        _items.addAll(page.items.where((e) => e['status'] == 'Available'));
-        _cursor      = page.cursor ?? _cursor;
-        _hasMore     = page.hasMore;
-        _loading     = false;
-        _loadingMore = false;
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _failed      = _items.isEmpty;
-        _hasMore     = false;
-        _loading     = false;
-        _loadingMore = false;
-      });
-    }
-  }
-
-  Widget _footer() {
-    if (_loadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-              width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
-        ),
-      );
-    }
-    if (_items.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.only(top: 40),
-        child: Center(
-          child: Text('No available equipment.',
-              style: TextStyle(color: AppTheme.textMid)),
-        ),
-      );
-    }
-    return const SizedBox(height: 4);
   }
 
   @override
   Widget build(BuildContext context) {
-    // Every item loaded so far was filtered out — pull the next page.
-    if (!_loading && !_loadingMore && _hasMore && _items.length < _pageSize) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
-    }
+    final q = _search.trim().toLowerCase();
+    final shown = q.isEmpty
+        ? _types
+        : _types.where((t) => '${t['name']}'.toLowerCase().contains(q)).toList();
 
     return Container(
-      height: MediaQuery.of(context).size.height * 0.75,
+      height: MediaQuery.of(context).size.height * 0.8,
       decoration: const BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
@@ -125,8 +79,7 @@ class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
           margin: const EdgeInsets.only(top: 12),
           width: 40, height: 4,
           decoration: BoxDecoration(
-              color: AppTheme.divider,
-              borderRadius: BorderRadius.circular(2)),
+              color: AppTheme.divider, borderRadius: BorderRadius.circular(2)),
         ),
         const SizedBox(height: 12),
         const Padding(
@@ -134,7 +87,7 @@ class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
           child: Row(children: [
             Icon(Icons.science_outlined, color: AppTheme.primary, size: 20),
             SizedBox(width: 10),
-            Text('Select Equipment',
+            Text('Add Equipment',
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold,
                     color: AppTheme.textDark)),
           ]),
@@ -142,10 +95,20 @@ class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
         const SizedBox(height: 4),
         const Padding(
           padding: EdgeInsets.symmetric(horizontal: 20),
-          child: Text('Only available equipment is shown.',
+          child: Text('Only items available right now are shown.',
               style: TextStyle(fontSize: 12, color: AppTheme.textMid)),
         ),
-        const SizedBox(height: 12),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: TextField(
+            controller: _searchCtrl,
+            onChanged: (v) => setState(() => _search = v),
+            decoration: const InputDecoration(
+              hintText: 'Search equipment...',
+              prefixIcon: Icon(Icons.search_rounded, color: AppTheme.textMid),
+            ),
+          ),
+        ),
         const Divider(color: AppTheme.divider, height: 1),
         Expanded(
           child: _loading
@@ -154,66 +117,82 @@ class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
                   ? const Center(
                       child: Text('Could not load equipment.',
                           style: TextStyle(color: AppTheme.textMid)))
-                  : ListView.separated(
-                      controller: _scrollController,
-                      padding: const EdgeInsets.all(16),
-                      // One extra row for the paging footer.
-                      itemCount: _items.length + 1,
-                      separatorBuilder: (_, _) => const SizedBox(height: 8),
-                      itemBuilder: (_, i) {
-                        if (i == _items.length) return _footer();
-                        final e = _items[i];
-                        final isSelected =
-                            widget.selectedId == '${e['equipment_id']}';
-                        return GestureDetector(
-                          onTap: () => Navigator.pop(context, e),
-                          child: Container(
-                            padding: const EdgeInsets.all(14),
-                            decoration: BoxDecoration(
-                              color: isSelected
-                                  ? const Color(0x121B3A8C)
-                                  : Colors.white,
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(
-                                  color: isSelected
-                                      ? AppTheme.primary
-                                      : AppTheme.divider),
-                            ),
-                            child: Row(children: [
-                              EquipmentThumb(
-                                bytes: photoThumbOf(e),
-                                category: e['category'] as String? ?? '',
-                                color: AppTheme.success,
-                                size: 40,
+                  : shown.isEmpty
+                      ? const Center(
+                          child: Text('No available equipment.',
+                              style: TextStyle(color: AppTheme.textMid)))
+                      : ListView.separated(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: shown.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 8),
+                          itemBuilder: (_, i) {
+                            final t = shown[i];
+                            final added = widget.alreadyAdded.contains('${t['name']}');
+                            final count = t['count'] as int? ?? 0;
+                            return GestureDetector(
+                              onTap: () => Navigator.pop(context, t),
+                              child: Container(
+                                padding: const EdgeInsets.all(14),
+                                decoration: BoxDecoration(
+                                  color: added ? const Color(0x121B3A8C) : Colors.white,
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                      color: added ? AppTheme.primary : AppTheme.divider),
+                                ),
+                                child: Row(children: [
+                                  EquipmentThumb(
+                                    bytes: photoThumbOf(t),
+                                    category: '${t['category'] ?? ''}',
+                                    color: AppTheme.success,
+                                    size: 40,
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                    Text('${t['name']}',
+                                        style: const TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 14,
+                                            color: AppTheme.textDark)),
+                                    Text('$count available  •  ${t['category'] ?? ''}',
+                                        style: const TextStyle(
+                                            fontSize: 12, color: AppTheme.textMid)),
+                                  ])),
+                                  Icon(
+                                    added
+                                        ? Icons.check_circle_rounded
+                                        : Icons.add_circle_outline_rounded,
+                                    color: added ? AppTheme.primary : AppTheme.success,
+                                  ),
+                                ]),
                               ),
-                              const SizedBox(width: 12),
-                              Expanded(child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                Text(e['equipment_name'] as String,
-                                    style: const TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 14,
-                                        color: AppTheme.textDark)),
-                                Text('${e['qr_code']}  •  ${e['category']}',
-                                    style: const TextStyle(
-                                        fontSize: 12, color: AppTheme.textMid)),
-                              ])),
-                              StatusBadge(label: 'Available', color: AppTheme.success),
-                              if (isSelected) ...[
-                                const SizedBox(width: 8),
-                                const Icon(Icons.check_circle_rounded,
-                                    color: AppTheme.primary, size: 20),
-                              ],
-                            ]),
-                          ),
-                        );
-                      },
-                    ),
+                            );
+                          },
+                        ),
         ),
       ]),
     );
   }
+}
+
+// One line of the request: an item type and how many.
+class _Line {
+  final String name;
+  final String category;
+  final Uint8List? thumb;
+  // How many units are free right now; null while still being checked.
+  int? available;
+  int qty = 1;
+  // The unit the student was looking at, reserved first if it is still free.
+  final String preferId;
+  _Line({
+    required this.name,
+    required this.category,
+    this.thumb,
+    this.available,
+    this.preferId = '',
+  });
 }
 
 // ─── Borrow Request Screen ─────────────────────────────────────────────────────
@@ -221,8 +200,8 @@ class _EquipmentPickerSheetState extends State<_EquipmentPickerSheet> {
 class BorrowRequestScreen extends StatefulWidget {
   final String? equipmentName;
   final String equipmentId; // Firebase doc ID is a String
-  // Full equipment record when the student arrives from the catalog, so the
-  // confirmation card can show the photo without re-reading the document.
+  // Full equipment record when the student arrives from the catalog, so its
+  // type can be added to the request straight away, with its photo.
   final Map<String, dynamic>? equipment;
   const BorrowRequestScreen({
     super.key,
@@ -235,26 +214,16 @@ class BorrowRequestScreen extends StatefulWidget {
 }
 
 class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
-  int _qty = 1;
   bool _loading = false;
   bool _agreedToPolicies = false;
-  final _nameCtrl    = TextEditingController();
-  final _idCtrl      = TextEditingController();
   final _subjectCtrl = TextEditingController();
   final _purposeCtrl = TextEditingController();
+  final List<_Line> _lines = [];
 
-  // Selected equipment — Firebase doc ID stored as String
-  String _selectedEquipmentId   = '';
-  String _selectedEquipmentName = '';
-  // Full record of the selection, so the student can check the photo and the
-  // identifying details before submitting and avoid requesting the wrong item.
-  Map<String, dynamic> _selectedEquipment = {};
-
-  String _sel(String key) => '${_selectedEquipment[key] ?? ''}';
-
-  // Borrow time — default now, return time — default 5:00 PM
-  TimeOfDay _borrowTime = TimeOfDay.now();
+  // Return time — default 5:00 PM, the latest the lab allows.
   TimeOfDay _returnTime = const TimeOfDay(hour: 17, minute: 0);
+
+  int get _total => _lines.fold(0, (n, l) => n + l.qty);
 
   // Build DateTime from today + selected TimeOfDay
   DateTime _toDateTime(TimeOfDay t) {
@@ -269,48 +238,28 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
     return '$h:$m $p';
   }
 
-  Future<void> _pickBorrowTime() async {
-    final picked = await showTimePicker(
-      context: context,
-      initialTime: _borrowTime,
-      helpText: 'Select Borrow Time',
-    );
-    if (picked == null) return;
-    if (_minutes(picked) >= _minutes(_returnTime)) {
-      _warn('Borrow time must be earlier than the return time '
-          '(${_formatTime(_returnTime)}).');
-      return;
-    }
-    setState(() => _borrowTime = picked);
-  }
+  // Minutes since midnight — the return time is always today under the
+  // same-day policy, so comparing times needs nothing more.
+  int _minutes(TimeOfDay t) => t.hour * 60 + t.minute;
 
   Future<void> _pickReturnTime() async {
     final picked = await showTimePicker(
       context: context,
       initialTime: _returnTime,
-      helpText: 'Select Return Time',
+      helpText: 'Return by',
     );
-    if (picked != null) {
-      // Enforce max 5:00 PM
-      final maxReturn = const TimeOfDay(hour: 17, minute: 0);
-      if (picked.hour > 17 || (picked.hour == 17 && picked.minute > 0)) {
-        setState(() => _returnTime = maxReturn);
-        _warn('Return time cannot be later than 5:00 PM.');
-      } else if (_minutes(picked) <= _minutes(_borrowTime)) {
-        // A return before the borrow time is not a loan period, and one
-        // already in the past is overdue the moment staff approve it
-        // (QA 2026-09-19, M3). Refuse it instead of storing it.
-        _warn('Return time must be later than the borrow time '
-            '(${_formatTime(_borrowTime)}).');
-      } else {
-        setState(() => _returnTime = picked);
-      }
+    if (picked == null) return;
+    if (picked.hour > 17 || (picked.hour == 17 && picked.minute > 0)) {
+      setState(() => _returnTime = const TimeOfDay(hour: 17, minute: 0));
+      _warn('Return time cannot be later than 5:00 PM.');
+    } else if (_minutes(picked) <= _minutes(TimeOfDay.now())) {
+      // A return time already gone by makes the loan overdue the moment staff
+      // approve it (QA 2026-09-19, M3). Refuse it instead of storing it.
+      _warn('That time has already passed. Choose a later time today.');
+    } else {
+      setState(() => _returnTime = picked);
     }
   }
-
-  // Minutes since midnight — the borrow and return times are always on the
-  // same day under the same-day policy, so comparing them needs nothing more.
-  int _minutes(TimeOfDay t) => t.hour * 60 + t.minute;
 
   void _warn(String message) {
     if (!mounted) return;
@@ -324,51 +273,70 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
   @override
   void initState() {
     super.initState();
-    _nameCtrl.text = Session.name;
-    _idCtrl.text   = Session.studentNumber;
-    // Pre-fill if coming from catalog
-    _selectedEquipmentId   = widget.equipmentId;
-    _selectedEquipmentName = widget.equipmentName ?? '';
-    _selectedEquipment     = widget.equipment ?? {};
-    // Arrived with an id but no record (e.g. an older call site) — fetch just
-    // that document so the confirmation card still shows the photo.
-    if (_selectedEquipmentId.isNotEmpty && _selectedEquipment.isEmpty) {
-      ApiService.getEquipmentById(_selectedEquipmentId).then((match) {
-        if (!mounted || match == null) return;
-        setState(() => _selectedEquipment = match);
+    // Arrived from the catalog: start the request with that item's type.
+    final e = widget.equipment;
+    final rawName = '${e?['equipment_name'] ?? widget.equipmentName ?? ''}';
+    if (rawName.trim().isNotEmpty) {
+      final line = _Line(
+        name: ApiService.baseNameOf(rawName),
+        category: '${e?['category'] ?? ''}',
+        thumb: photoThumbOf(e),
+        preferId: widget.equipmentId.isNotEmpty
+            ? widget.equipmentId
+            : '${e?['equipment_id'] ?? ''}',
+      );
+      _lines.add(line);
+      // How many of that type are free, for the quantity limit.
+      ApiService.getAvailableTypes().then((types) {
+        if (!mounted) return;
+        final match = types.where((t) => t['name'] == line.name).toList();
+        setState(() => line.available =
+            match.isEmpty ? 0 : (match.first['count'] as int? ?? 0));
       }).catchError((_) {});
     }
   }
 
   @override
   void dispose() {
-    _nameCtrl.dispose();
-    _idCtrl.dispose();
     _subjectCtrl.dispose();
     _purposeCtrl.dispose();
     super.dispose();
   }
 
-  // Opens a bottom sheet to pick equipment from the catalog
-  Future<void> _pickEquipment() async {
+  Future<void> _addItems() async {
     final picked = await showModalBottomSheet<Map<String, dynamic>>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => _EquipmentPickerSheet(selectedId: _selectedEquipmentId),
+      builder: (_) =>
+          _TypePickerSheet(alreadyAdded: {for (final l in _lines) l.name}),
     );
     if (picked == null) return;
+    final name = '${picked['name']}';
+    final count = picked['count'] as int? ?? 0;
     setState(() {
-      _selectedEquipmentId   = '${picked['equipment_id']}';
-      _selectedEquipmentName = picked['equipment_name'] as String;
-      _selectedEquipment     = picked;
+      final existing = _lines.where((l) => l.name == name).toList();
+      if (existing.isNotEmpty) {
+        final l = existing.first;
+        l.available = count;
+        if (l.qty < count && _total < kMaxUnitsPerRequest) l.qty++;
+      } else if (_total < kMaxUnitsPerRequest) {
+        _lines.add(_Line(
+          name: name,
+          category: '${picked['category'] ?? ''}',
+          thumb: photoThumbOf(picked),
+          available: count,
+        ));
+      } else {
+        _warn('At most $kMaxUnitsPerRequest items per request.');
+      }
     });
   }
 
   Future<void> _submitRequest() async {
-    if (_selectedEquipmentId.isEmpty) {
+    if (_lines.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select an equipment first.'),
+        const SnackBar(content: Text('Add the equipment you need first.'),
             backgroundColor: AppTheme.danger));
       return;
     }
@@ -411,11 +379,6 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
           '5:00 PM. Please file the request tomorrow.');
       return;
     }
-    if (_minutes(_returnTime) <= _minutes(_borrowTime)) {
-      _warn('Return time must be later than the borrow time '
-          '(${_formatTime(_borrowTime)}).');
-      return;
-    }
     if (_minutes(_returnTime) <= _minutes(nowTime)) {
       _warn('Return time ${_formatTime(_returnTime)} has already passed. '
           'Please choose a later time.');
@@ -425,15 +388,15 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
     try {
       final res = await ApiService.borrowEquipment({
         'student_id':     Session.currentUser?['student_id']?.toString() ?? '',
-        'equipment_id':   _selectedEquipmentId,
-        'borrower_name':  _nameCtrl.text.trim(),
-        'student_number': _idCtrl.text.trim(),
+        'borrower_name':  Session.name,
+        'student_number': Session.studentNumber,
         'subject':        _subjectCtrl.text.trim(),
-        'quantity':       _qty,
-        'borrow_date':    _toDateTime(_borrowTime).toIso8601String(),
         'due_date':       _toDateTime(_returnTime).toIso8601String(),
         'purpose':        _purposeCtrl.text.trim(),
-      });
+      }, [
+        for (final l in _lines)
+          (name: l.name, quantity: l.qty, preferId: l.preferId),
+      ]);
       if (!mounted) return;
       if (res['success'] == true) {
         showDialog(context: context, barrierDismissible: false,
@@ -441,10 +404,10 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
             icon: const Icon(Icons.check_circle_rounded, color: AppTheme.success, size: 52),
             title: const Text('Request Submitted!'),
-            // The deadline the student actually chose — this used to read
-            // "before 5:00 PM" whatever was picked (QA 2026-09-19, M3).
-            content: Text('Your borrowing request has been submitted and is '
-                'awaiting staff approval. Please return the equipment by '
+            // What happens next, in order, so the student knows what to do.
+            content: Text('You asked for ${res['summary'] ?? 'your equipment'}.\n\n'
+                'Next: wait for staff to approve it (see My Loans). Once '
+                'approved, pick it up at the lab and return it by '
                 '${_formatTime(_returnTime)} today.',
                 textAlign: TextAlign.center),
             actions: [ElevatedButton(
@@ -452,9 +415,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
               child: const Text('Done'))],
           ));
       } else {
-        // The full message is shown so it can be read completely. (Until
-        // 2026-09-20 a program/course restriction had its own dialog here; the
-        // restriction was removed, so every failure is a plain error now.)
+        // The full message is shown so it can be read completely.
         showDialog(context: context,
           builder: (_) => AlertDialog(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -478,6 +439,60 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
     }
   }
 
+  // One requested item type with its quantity stepper.
+  Widget _lineCard(_Line l) {
+    final avail = l.available;
+    final none = avail != null && avail == 0;
+    final canAdd = (avail == null || l.qty < avail) && _total < kMaxUnitsPerRequest;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: none ? AppTheme.danger : AppTheme.divider),
+      ),
+      child: Row(children: [
+        EquipmentThumb(
+            bytes: l.thumb, category: l.category, color: AppTheme.success, size: 44),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(l.name,
+                style: const TextStyle(
+                    fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
+            Text(
+              avail == null
+                  ? 'Checking availability…'
+                  : none
+                      ? 'Not available right now'
+                      : '$avail available',
+              style: TextStyle(
+                  fontSize: 12, color: none ? AppTheme.danger : AppTheme.textMid),
+            ),
+          ]),
+        ),
+        IconButton(
+          tooltip: 'Fewer',
+          onPressed: l.qty > 1 ? () => setState(() => l.qty--) : null,
+          icon: const Icon(Icons.remove_circle_outline_rounded),
+        ),
+        Text('${l.qty}',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        IconButton(
+          tooltip: 'More',
+          onPressed: canAdd ? () => setState(() => l.qty++) : null,
+          icon: const Icon(Icons.add_circle_outline_rounded),
+        ),
+        IconButton(
+          tooltip: 'Remove',
+          onPressed: () => setState(() => _lines.remove(l)),
+          icon: const Icon(Icons.close_rounded, color: AppTheme.textMid),
+        ),
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -487,258 +502,92 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Equipment picker — tappable
+            // ── 1. What to borrow ──
+            FieldLabel('Equipment'),
+            const SizedBox(height: 8),
+            for (final l in _lines) _lineCard(l),
             GestureDetector(
-              onTap: _pickEquipment,
+              onTap: _addItems,
               child: Container(
+                width: double.infinity,
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                    color: _selectedEquipmentId.isEmpty
-                        ? const Color(0x0FF5A623)
-                        : const Color(0x0F06D6A0),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                        color: _selectedEquipmentId.isEmpty
-                            ? const Color(0x4DF5A623)
-                            : AppTheme.success.withValues(alpha: 0.3))),
-                child: Row(
-                  children: [
-                    if (_selectedEquipmentId.isEmpty)
-                      Container(
-                        width: 48, height: 48,
-                        decoration: BoxDecoration(
-                            color: AppTheme.accent.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(12)),
-                        child: const Icon(Icons.add_circle_outline_rounded,
-                            color: AppTheme.accent),
-                      )
-                    else
-                      EquipmentThumb(
-                        bytes: photoThumbOf(_selectedEquipment),
-                        category: _sel('category'),
-                        color: AppTheme.success,
-                        size: 64,
-                      ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            _selectedEquipmentId.isEmpty
-                                ? 'Tap to Select Equipment'
-                                : _selectedEquipmentName,
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 15,
-                                color: _selectedEquipmentId.isEmpty
-                                    ? AppTheme.accent
-                                    : AppTheme.textDark),
-                          ),
-                          const SizedBox(height: 2),
-                          // Identifying details, so two similar-looking items
-                          // are not mistaken for one another.
-                          if (_selectedEquipmentId.isNotEmpty) ...[
-                            if (_sel('qr_code').isNotEmpty)
-                              Text(
-                                [_sel('qr_code'), _sel('category')]
-                                    .where((s) => s.isNotEmpty)
-                                    .join('  •  '),
-                                style: const TextStyle(
-                                    fontSize: 12, color: AppTheme.textMid),
-                              ),
-                            if (_sel('brand').isNotEmpty ||
-                                _sel('model').isNotEmpty)
-                              Text(
-                                [_sel('brand'), _sel('model')]
-                                    .where((s) => s.isNotEmpty)
-                                    .join(' '),
-                                style: const TextStyle(
-                                    fontSize: 12, color: AppTheme.textMid),
-                              ),
-                            const SizedBox(height: 2),
-                          ],
-                          Text(
-                            _selectedEquipmentId.isEmpty
-                                ? 'Required — choose from available equipment'
-                                : 'Check the photo, then tap to change selection',
-                            style: const TextStyle(
-                                fontSize: 12, color: AppTheme.textMid),
-                          ),
-                        ],
-                      ),
+                    color: const Color(0x0FF5A623),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0x4DF5A623))),
+                child: Row(children: [
+                  const Icon(Icons.add_circle_outline_rounded, color: AppTheme.accent),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _lines.isEmpty ? 'Add equipment' : 'Add another item',
+                      style: const TextStyle(
+                          fontWeight: FontWeight.bold, color: AppTheme.accent),
                     ),
-                    Icon(
-                      Icons.chevron_right_rounded,
-                      color: _selectedEquipmentId.isEmpty
-                          ? AppTheme.accent
-                          : AppTheme.success,
-                    ),
-                  ],
-                ),
+                  ),
+                  Text('$_total / $kMaxUnitsPerRequest',
+                      style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+                ]),
               ),
             ),
-            const SizedBox(height: 20),
-            // Name and Student ID come from the signed-in account and are
-            // read-only: the request is filed under the profile regardless
-            // (see ApiService.borrowEquipment), so letting them be edited only
-            // invited a forged identity (QA 2026-09-19, H5).
-            FieldLabel('Borrower Name'),
             const SizedBox(height: 8),
-            TextField(controller: _nameCtrl, readOnly: true,
-                decoration: const InputDecoration(
-                    suffixIcon: Icon(Icons.lock_outline_rounded, size: 18, color: AppTheme.textMid))),
-            const SizedBox(height: 16),
-            FieldLabel('Student ID'),
-            const SizedBox(height: 8),
-            TextField(controller: _idCtrl, readOnly: true,
-                decoration: const InputDecoration(
-                    suffixIcon: Icon(Icons.lock_outline_rounded, size: 18, color: AppTheme.textMid),
-                    helperText: 'From your account. Change your name in Profile → Edit Profile.')),
-            const SizedBox(height: 16),
-            FieldLabel('Subject / Section'),
-            const SizedBox(height: 8),
-            TextField(controller: _subjectCtrl, decoration: const InputDecoration(hintText: 'e.g. PHYS101 - Sec A')),
-            const SizedBox(height: 16),
-            FieldLabel('Quantity'),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppTheme.divider)),
-              child: Row(
-                children: [
-                  IconButton(
-                      onPressed: () => setState(() => _qty = (_qty - 1).clamp(1, 10)),
-                      icon: const Icon(Icons.remove_rounded)),
-                  Expanded(child: Center(child: Text('$_qty',
-                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)))),
-                  IconButton(
-                      onPressed: () => setState(() => _qty = (_qty + 1).clamp(1, 10)),
-                      icon: const Icon(Icons.add_rounded)),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            // ── Time Selection ──
+            // Who is borrowing: from the signed-in account, not editable — the
+            // request is filed under the profile regardless (QA 2026-09-19, H5).
             Row(children: [
-              // Borrow Time
+              const Icon(Icons.person_outline_rounded, size: 16, color: AppTheme.textMid),
+              const SizedBox(width: 6),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    FieldLabel('Borrow Time'),
-                    const SizedBox(height: 8),
-                    GestureDetector(
-                      onTap: _pickBorrowTime,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 13),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: AppTheme.divider),
-                        ),
-                        child: Row(children: [
-                          const Icon(Icons.access_time_rounded,
-                              color: AppTheme.primary, size: 18),
-                          const SizedBox(width: 8),
-                          Text(_formatTime(_borrowTime),
-                              style: const TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600,
-                                  color: AppTheme.textDark)),
-                        ]),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              // Return Time
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    FieldLabel('Return Time'),
-                    const SizedBox(height: 8),
-                    GestureDetector(
-                      onTap: _pickReturnTime,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 13),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                              color: _returnTime.hour >= 17
-                                  ? AppTheme.warning
-                                  : AppTheme.divider),
-                        ),
-                        child: Row(children: [
-                          Icon(Icons.timer_outlined,
-                              color: _returnTime.hour >= 17
-                                  ? AppTheme.warning
-                                  : AppTheme.primary,
-                              size: 18),
-                          const SizedBox(width: 8),
-                          Text(_formatTime(_returnTime),
-                              style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600,
-                                  color: _returnTime.hour >= 17
-                                      ? AppTheme.warning
-                                      : AppTheme.textDark)),
-                        ]),
-                      ),
-                    ),
-                  ],
-                ),
+                child: Text('Borrowing as ${Session.name} · ${Session.studentNumber}',
+                    style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
               ),
             ]),
-            const SizedBox(height: 6),
-            const Text('⚠️ Equipment must be returned before 5:00 PM.',
-                style: TextStyle(fontSize: 11, color: AppTheme.textMid)),
-            const SizedBox(height: 16),
-            // ── Return Deadline info ──
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0x14FFB703),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0x4DFFB703)),
-              ),
-              child: Row(children: [
-                const Icon(Icons.access_time_rounded,
-                    color: AppTheme.warning, size: 20),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                    const Text('Return Deadline',
-                        style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: AppTheme.warning)),
-                    const SizedBox(height: 2),
-                    Text(
-                        'Selected return time: ${_formatTime(_returnTime)}. All equipment must be returned today.',
-                        style: const TextStyle(
-                            fontSize: 12, color: AppTheme.textDark)),
-                  ]),
+            const SizedBox(height: 20),
+
+            // ── 2. Until when ──
+            FieldLabel('Return by'),
+            const SizedBox(height: 8),
+            GestureDetector(
+              onTap: _pickReturnTime,
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppTheme.divider),
                 ),
-              ]),
+                child: Row(children: [
+                  const Icon(Icons.timer_outlined, color: AppTheme.primary, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text('${_formatTime(_returnTime)} today',
+                        style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: AppTheme.textDark)),
+                  ),
+                  const Text('Change',
+                      style: TextStyle(fontSize: 12, color: AppTheme.accent)),
+                ]),
+              ),
             ),
+            const SizedBox(height: 6),
+            const Text('Everything is returned the same day, by 5:00 PM at the latest.',
+                style: TextStyle(fontSize: 11, color: AppTheme.textMid)),
+            const SizedBox(height: 20),
+
+            // ── 3. Optional details ──
+            FieldLabel('Subject / Section (optional)'),
+            const SizedBox(height: 8),
+            TextField(controller: _subjectCtrl,
+                decoration: const InputDecoration(hintText: 'e.g. CE 311 - Sec A')),
             const SizedBox(height: 16),
-            FieldLabel('Purpose / Notes'),
+            FieldLabel('Purpose (optional)'),
             const SizedBox(height: 8),
             TextField(
               controller: _purposeCtrl,
-              maxLines: 3,
-              decoration: const InputDecoration(hintText: 'Describe the purpose of borrowing...'),
+              maxLines: 2,
+              decoration: const InputDecoration(hintText: 'e.g. Slump test'),
             ),
             const SizedBox(height: 20),
 
@@ -865,6 +714,3 @@ class _PolicyReminder extends StatelessWidget {
     ]);
   }
 }
-
-
-

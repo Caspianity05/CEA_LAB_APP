@@ -24,6 +24,8 @@ import 'admin_penalties_screen.dart';
 import 'admin_students_screen.dart';
 import 'staff_profile_screen.dart';
 import 'admin_staff_accounts_screen.dart';
+import 'request_card.dart';
+import 'return_flow.dart';
 
 // ─── Admin Dashboard Screen ────────────────────────────────────────────────────
 
@@ -315,39 +317,50 @@ class _AdminHomeState extends State<_AdminHome> {
     _load();
   }
 
-  Future<void> _approve(String txId) async {
-    final res = await ApiService.updateRequestStatus(txId, 'approve');
+  // A request may hold several records (one per unit); they are decided
+  // together.
+  Future<void> _approve(List<dynamic> request) async {
+    final res = await ApiService.decideRequest(
+        [for (final t in request) '${t['transaction_id']}'], 'approve');
     _showResult(res, 'Request approved.');
   }
 
-  Future<void> _reject(String txId) async {
+  Future<void> _reject(List<dynamic> request) async {
     final reason = await showRejectRequestDialog(context);
     if (reason == null) return;
-    final res = await ApiService.updateRequestStatus(txId, 'reject', reason: reason);
+    final res = await ApiService.decideRequest(
+        [for (final t in request) '${t['transaction_id']}'], 'reject',
+        reason: reason);
     _showResult(res, 'Request rejected.');
   }
 
-  Future<void> _return(String txId, String equipmentName) async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Confirm Return'),
-        content: Text('Mark "$equipmentName" as returned?'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel', style: TextStyle(color: AppTheme.textMid))),
-          ElevatedButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Confirm Return')),
-        ],
-      ),
+  // The same Good / Report Damage step as Scan QR (return_flow.dart). This
+  // used to be a plain confirm that always recorded Good, so a damaged item
+  // returned from here could not be logged (prof's comment 2026-10-05).
+  Future<void> _return(dynamic loan) async {
+    await showReturnSheet(
+      context,
+      equipment: {
+        'equipment_id':   loan['equipment_id'],
+        'equipment_name': loan['equipment_name'],
+        'qr_code':        loan['qr_code'],
+        'category':       loan['category'],
+        'status':         'Borrowed',
+      },
+      closeLabel: 'Cancel',
+      doReturn: (condition) async {
+        final res =
+            await ApiService.returnEquipment('${loan['transaction_id']}', condition);
+        // The damage follow-up needs to know whose loan it was.
+        return {
+          ...res,
+          'student_id':     '${loan['student_id'] ?? ''}',
+          'borrower_name':  '${loan['borrower_name'] ?? loan['student_number'] ?? ''}',
+          'student_number': '${loan['student_number'] ?? ''}',
+        };
+      },
     );
-    if (confirm == true) {
-      final res = await ApiService.returnEquipment(txId, 'Good');
-      _showResult(res, 'Equipment marked as returned!');
-    }
+    if (mounted) _load();
   }
 
   @override
@@ -631,7 +644,7 @@ class _AdminHomeState extends State<_AdminHome> {
 
                       // ── Pending Approvals ──
                       SectionHeader(
-                          title: 'Pending Approvals (${_pending.length})',
+                          title: 'Pending Approvals (${ApiService.groupRequests(_pending).length})',
                           action: 'View all',
                           onAction: () {}),
                       const SizedBox(height: 12),
@@ -652,64 +665,13 @@ class _AdminHomeState extends State<_AdminHome> {
                           ),
                         )
                       else
-                        ..._pending.map((e) {
-                          final txId = '${e['transaction_id']}';
-                          final name = e['borrower_name'] ?? e['student_number'] ?? 'Student';
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: Container(
-                              padding: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                  color: Colors.white,
-                                  borderRadius: BorderRadius.circular(16),
-                                  border: Border.all(color: const Color(0x33F5A623))),
-                              child: Column(children: [
-                                Row(children: [
-                                  CircleAvatar(
-                                    radius: 18,
-                                    backgroundColor: const Color(0x1AF5A623),
-                                    child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?',
-                                        style: const TextStyle(color: AppTheme.accent,
-                                            fontWeight: FontWeight.bold)),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                    Text(name, style: const TextStyle(
-                                        fontWeight: FontWeight.bold, fontSize: 13,
-                                        color: AppTheme.textDark)),
-                                    Text('${e['equipment_name']}  •  Qty: ${e['quantity'] ?? 1}',
-                                        style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
-                                  ])),
-                                  StatusBadge(label: 'Pending', color: AppTheme.accent),
-                                ]),
-                                if (Session.canManage) ...[
-                                  const SizedBox(height: 12),
-                                  const Divider(color: AppTheme.divider, height: 1),
-                                  const SizedBox(height: 10),
-                                  Row(children: [
-                                    Expanded(child: OutlinedButton.icon(
-                                      onPressed: () => _reject(txId),
-                                      icon: const Icon(Icons.close_rounded, size: 16),
-                                      label: const Text('Deny'),
-                                      style: OutlinedButton.styleFrom(
-                                          foregroundColor: AppTheme.danger,
-                                          side: const BorderSide(color: AppTheme.danger)),
-                                    )),
-                                    const SizedBox(width: 10),
-                                    Expanded(child: ElevatedButton.icon(
-                                      onPressed: () => _approve(txId),
-                                      icon: const Icon(Icons.check_rounded, size: 16),
-                                      label: const Text('Approve'),
-                                      style: ElevatedButton.styleFrom(
-                                          backgroundColor: AppTheme.success),
-                                    )),
-                                  ]),
-                                ],
-                              ]),
-                            ),
-                          );
-                        }),
+                        // One card per request, however many units it holds.
+                        for (final request in ApiService.groupRequests(_pending))
+                          PendingRequestCard(
+                            request: request,
+                            onApprove: () => _approve(request),
+                            onReject: () => _reject(request),
+                          ),
                       const SizedBox(height: 24),
 
                       // ── Active Loans (Approved — awaiting return) ──
@@ -731,8 +693,8 @@ class _AdminHomeState extends State<_AdminHome> {
                         )
                       else
                         ..._approved.map((e) {
-                          final txId = '${e['transaction_id']}';
-                          final name = e['borrower_name'] ?? e['student_number'] ?? 'Student';
+                          // Always a String, whatever the record holds (QA 2026-10-03).
+                          final name = '${e['borrower_name'] ?? e['student_number'] ?? 'Student'}';
                           final equipName = e['equipment_name'] ?? 'Equipment';
                           final dueDate = (e['due_date'] ?? '').toString().split('T').first;
                           // Every active loan was badged a green "Active",
@@ -782,7 +744,7 @@ class _AdminHomeState extends State<_AdminHome> {
                                   SizedBox(
                                     width: double.infinity,
                                     child: ElevatedButton.icon(
-                                      onPressed: () => _return(txId, equipName),
+                                      onPressed: () => _return(e),
                                       icon: const Icon(Icons.assignment_return_rounded, size: 16),
                                       label: const Text('Mark as Returned'),
                                       style: ElevatedButton.styleFrom(

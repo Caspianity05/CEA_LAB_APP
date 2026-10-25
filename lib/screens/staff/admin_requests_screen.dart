@@ -2,15 +2,18 @@
 // LabTrack - staff: admin requests screen
 //
 // Extracted from firstFile.dart on 2026-08-03 as step 7 of the module split.
+// 2026-10-05: Pending shows one card per request (a request can hold several
+// units, see request_card.dart); the lists no longer read the whole
+// borrow_transactions collection (Pending/Approved live, All = last 90 days).
 // -----------------------------------------------------------------------------
 
 
 import 'package:flutter/material.dart';
 
 import '../../services/api_service.dart';
-import '../../services/session.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
+import 'request_card.dart';
 
 // ─── Admin Requests Screen ────────────────────────────────────────────────────
 
@@ -21,9 +24,11 @@ class AdminRequestsScreen extends StatefulWidget {
 }
 
 class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
-  // Live Firestore stream: new requests pop in as students submit them and
-  // status changes render immediately — no manual refresh.
+  // Live Firestore streams: new requests pop in as students submit them and
+  // status changes render immediately — no manual refresh. Pending and
+  // Approved are naturally small; "All" covers the same 90 days as Reports.
   late final Stream<List<dynamic>> _stream = ApiService.requestsStream();
+  late final Stream<List<dynamic>> _recent = ApiService.recentRequestsStream();
 
   // True when this loan's due date has gone by. Uses the shared parser so an
   // ISO string and a raw Firestore Timestamp are both handled.
@@ -42,9 +47,13 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     }
   }
 
-  Future<void> _action(String txId, String action, {String reason = ''}) async {
+  // Approve or reject every record of one request.
+  Future<void> _decide(List<dynamic> request, String action,
+      {String reason = ''}) async {
     try {
-      final res = await ApiService.updateRequestStatus(txId, action, reason: reason);
+      final res = await ApiService.decideRequest(
+          [for (final t in request) '${t['transaction_id']}'], action,
+          reason: reason);
       if (mounted && res['success'] != true) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(res['message'] ?? 'Action failed.'),
@@ -56,9 +65,9 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     } catch (_) {}
   }
 
-  Future<void> _confirmReject(String txId) async {
+  Future<void> _confirmReject(List<dynamic> request) async {
     final reason = await showRejectRequestDialog(context);
-    if (reason != null) _action(txId, 'reject', reason: reason);
+    if (reason != null) _decide(request, 'reject', reason: reason);
   }
 
   // One-line "who processed this" note built from the audit fields stamped on
@@ -77,7 +86,9 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     return '';
   }
 
-  Widget _buildCard(dynamic e, {bool showActions = false}) {
+  // One record (one unit), for the Approved and All tabs: each unit is
+  // returned on its own, so these stay one card per unit.
+  Widget _buildCard(dynamic e) {
     final status = e['status'] ?? '';
     // An Approved loan that is past its due date is overdue, and the badge
     // used to say plain "Approved" in green — so the Approved tab gave staff
@@ -86,8 +97,10 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     final isOverdue = status == 'Approved' && _isPastDue(e);
     final label = isOverdue ? 'Overdue' : status;
     final sc = isOverdue ? AppTheme.danger : _statusColor(status);
-    final txId = '${e['transaction_id']}';
-    final studentName = e['borrower_name'] ?? e['student_number'] ?? '';
+    // Always a String: `.isNotEmpty` and `[0]` below would throw on any other
+    // stored type and blank the card (QA 2026-10-03).
+    final studentName = '${e['borrower_name'] ?? e['student_number'] ?? ''}';
+    final subject = '${e['subject'] ?? ''}'.trim();
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
@@ -114,7 +127,7 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
             child: Row(children: [
               const Icon(Icons.science_outlined, size: 13, color: AppTheme.textMid),
               const SizedBox(width: 6),
-              Expanded(child: Text('${e['equipment_name'] ?? ''}  •  Qty: ${e['quantity'] ?? 1}',
+              Expanded(child: Text('${e['equipment_name'] ?? ''}  •  ${e['qr_code'] ?? ''}',
                   style: const TextStyle(fontSize: 12, color: AppTheme.textDark, fontWeight: FontWeight.w600))),
               const Icon(Icons.calendar_today_rounded, size: 13, color: AppTheme.textMid),
               const SizedBox(width: 4),
@@ -122,6 +135,11 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
                   style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
             ]),
           ),
+          if (subject.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text('Subject: $subject',
+                style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
+          ],
           if (status == 'Rejected' && '${e['reject_reason'] ?? ''}'.isNotEmpty) ...[
             const SizedBox(height: 8),
             Text('Reason: ${e['reject_reason']}',
@@ -140,35 +158,41 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
                   style: const TextStyle(fontSize: 10, color: AppTheme.textLight))),
             ]),
           ],
-          if (showActions && status == 'Pending' && Session.canManage) ...[
-            const SizedBox(height: 10),
-            Row(children: [
-              Expanded(child: OutlinedButton.icon(
-                onPressed: () => _confirmReject(txId),
-                icon: const Icon(Icons.close_rounded, size: 16),
-                label: const Text('Deny'),
-                style: OutlinedButton.styleFrom(foregroundColor: AppTheme.danger, side: const BorderSide(color: AppTheme.danger)),
-              )),
-              const SizedBox(width: 10),
-              Expanded(child: ElevatedButton.icon(
-                onPressed: () => _action(txId, 'approve'),
-                icon: const Icon(Icons.check_rounded, size: 16),
-                label: const Text('Approve'),
-                style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
-              )),
-            ]),
-          ],
         ]),
       ),
     );
   }
 
-  Widget _requestList(List<dynamic> items, String emptyText,
-      {bool showActions = false}) {
-    return ListView(padding: const EdgeInsets.all(16),
-        children: items.isEmpty
-            ? [Center(child: Padding(padding: const EdgeInsets.all(32), child: Text(emptyText, style: const TextStyle(color: AppTheme.textMid))))]
-            : items.map((e) => _buildCard(e, showActions: showActions)).toList());
+  Widget _empty(String text) => Center(
+      child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Text(text, style: const TextStyle(color: AppTheme.textMid))));
+
+  Widget _pendingList(List<dynamic> pending) {
+    final requests = ApiService.groupRequests(pending);
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      if (requests.isEmpty) _empty('No pending requests'),
+      for (final request in requests)
+        PendingRequestCard(
+          request: request,
+          onApprove: () => _decide(request, 'approve'),
+          onReject: () => _confirmReject(request),
+        ),
+    ]);
+  }
+
+  Widget _recordList(List<dynamic> items, String emptyText, {String? footer}) {
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      if (items.isEmpty) _empty(emptyText),
+      for (final e in items) _buildCard(e),
+      if (footer != null && items.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(top: 4, bottom: 8),
+          child: Center(
+              child: Text(footer,
+                  style: const TextStyle(fontSize: 11, color: AppTheme.textLight))),
+        ),
+    ]);
   }
 
   @override
@@ -206,9 +230,19 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
               ),
             ),
             body: TabBarView(children: [
-              _requestList(pending, 'No pending requests', showActions: true),
-              _requestList(approved, 'No approved requests'),
-              _requestList(all, 'No requests yet'),
+              _pendingList(pending),
+              _recordList(approved, 'No approved requests'),
+              StreamBuilder<List<dynamic>>(
+                stream: _recent,
+                builder: (context, recent) {
+                  if (recent.connectionState == ConnectionState.waiting) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  if (recent.hasError) return _empty('Could not load requests.');
+                  return _recordList(recent.data ?? const [], 'No requests yet',
+                      footer: 'Showing the last 90 days');
+                },
+              ),
             ]),
           ),
         );
@@ -216,6 +250,3 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     );
   }
 }
-
-
-

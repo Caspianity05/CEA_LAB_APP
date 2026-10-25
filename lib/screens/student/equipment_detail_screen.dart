@@ -65,6 +65,10 @@ class _EquipmentDetailScreenState extends State<EquipmentDetailScreen> {
     final brand     = equipment['brand']          as String? ?? '';
     final model     = equipment['model']          as String? ?? '';
     final serial    = equipment['serial_number']  as String? ?? '';
+    final iin       = '${equipment['iin'] ?? ''}'.trim();
+    final acquired  = ApiService.asDate(equipment['date_acquired']);
+    final added     = ApiService.asDate(equipment['created_at']);
+    final addedBy   = '${equipment['created_by_name'] ?? ''}'.trim();
     final desc      = equipment['description']    as String? ?? '';
     final photo     = _fullPhoto;
     final hasPhoto  = photo != null && photo.isNotEmpty;
@@ -170,19 +174,23 @@ class _EquipmentDetailScreenState extends State<EquipmentDetailScreen> {
                       border: Border.all(color: AppTheme.divider),
                     ),
                     child: Column(children: [
-                      if (brand.isNotEmpty)
-                        specRow('Brand / Manufacturer', brand, isFirst: true),
-                      if (model.isNotEmpty)
-                        specRow('Model', model, isFirst: brand.isEmpty),
-                      if (serial.isNotEmpty)
-                        specRow('Serial Number', serial,
-                            isFirst: brand.isEmpty && model.isEmpty),
-                      specRow('Category', category,
-                          isFirst: brand.isEmpty && model.isEmpty && serial.isEmpty),
-                      if (location.isNotEmpty) specRow('Storage Location', location),
-                      specRow('Status', status, isLast: courses.isEmpty),
-                      if (courses.isNotEmpty)
-                        specRow('Available to', courses.map((c) => courseLabel(c)).join(', '), isLast: true),
+                      for (final (i, row) in [
+                        if (brand.isNotEmpty) ('Brand / Manufacturer', brand),
+                        if (model.isNotEmpty) ('Model', model),
+                        if (serial.isNotEmpty) ('Serial Number', serial),
+                        if (iin.isNotEmpty) ('IIN', iin),
+                        ('Category', category),
+                        if (location.isNotEmpty) ('Storage Location', location),
+                        ('Status', status),
+                        if (courses.isNotEmpty)
+                          ('Available to', courses.map((c) => courseLabel(c)).join(', ')),
+                        if (acquired != null) ('Date Acquired', formatDate(acquired)),
+                        // When staff put it in the system; students don't need it.
+                        if (!isStudent && added != null)
+                          ('Date Added',
+                              addedBy.isEmpty ? formatDate(added) : '${formatDate(added)} by $addedBy'),
+                      ].indexed)
+                        specRow(row.$1, row.$2, isFirst: i == 0),
                     ]),
                   ),
                   // ── QR Code card ──
