@@ -2,10 +2,15 @@
 // LabTrack - student: equipment catalog screen
 //
 // Extracted from firstFile.dart on 2026-08-03 as step 6 of the module split.
+//
+// 1.0.19 (2026-10-15): the catalog lists item TYPES ("Sieve (USA Standard
+// Testing System) — 197 in the lab"), not every unit, from the item-type list:
+// one read for the whole catalog, then search, categories and programs filter
+// it on the phone. Paging through 1,067 units read up to all of them for one
+// search. A type's free units are counted when the student opens it.
 // -----------------------------------------------------------------------------
 
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../../constants.dart';
 import '../../services/api_service.dart';
@@ -34,78 +39,83 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
   bool _showAllCourses = false;
   bool _loading = true;
   bool _hasError = false;
-  List<dynamic> _items = [];
-
-  // Pagination — the catalog loads a screenful at a time rather than the whole
-  // equipment collection (see ApiService.getEquipmentPage).
-  static const int _pageSize = 20;
-  final _scrollController = ScrollController();
-  DocumentSnapshot? _cursor;
-  bool _hasMore = true;
-  bool _loadingMore = false;
+  // The item types with a unit in service. Until staff build the type list
+  // the old list is used (`_counted`): its numbers are units free right now
+  // rather than units in the lab.
+  List<Map<String, dynamic>> _types = [];
+  bool _counted = false;
+  // The type being opened (a spinner on its card).
+  String _opening = '';
 
   @override
   void initState() {
     super.initState();
-    _scrollController.addListener(_onScroll);
     _loadEquipment();
   }
 
   @override
   void dispose() {
-    _scrollController.removeListener(_onScroll);
-    _scrollController.dispose();
     _searchCtrl.dispose();
     super.dispose();
   }
 
-  void _onScroll() {
-    if (!_scrollController.hasClients) return;
-    final pos = _scrollController.position;
-    if (pos.pixels >= pos.maxScrollExtent - 400) _loadMore();
-  }
-
-  // First page / pull-to-refresh — resets the cursor.
-  Future<void> _loadEquipment() async {
+  // Pull-to-refresh asks for a fresh list rather than the one kept for a few
+  // minutes.
+  Future<void> _loadEquipment({bool refresh = false}) async {
     setState(() {
-      _loading = true;
+      _loading = _types.isEmpty;
       _hasError = false;
-      _items = [];
-      _cursor = null;
-      _hasMore = true;
     });
     try {
-      final page = await ApiService.getEquipmentPage(limit: _pageSize);
+      final res = await ApiService.getBorrowableTypes(refresh: refresh);
       if (!mounted) return;
       setState(() {
-        _items = page.items;
-        _cursor = page.cursor;
-        _hasMore = page.hasMore;
+        _types = res.types;
+        _counted = res.counted;
         _loading = false;
       });
     } catch (e) {
       if (!mounted) return;
-      setState(() { _loading = false; _hasError = true; });
+      setState(() { _loading = false; _hasError = _types.isEmpty; });
     }
   }
 
-  Future<void> _loadMore() async {
-    if (_loadingMore || !_hasMore || _loading) return;
-    setState(() => _loadingMore = true);
+  void _snack(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(message), behavior: SnackBarBehavior.floating));
+  }
+
+  // A type's page: its free units counted now (one read) and one unit read to
+  // show its details and photo (one more).
+  Future<void> _open(Map<String, dynamic> t) async {
+    if (_opening.isNotEmpty) return;
+    final name = '${t['name']}';
+    setState(() => _opening = name);
     try {
-      final page = await ApiService.getEquipmentPage(
-          limit: _pageSize, startAfter: _cursor);
+      final sampleF = ApiService.sampleUnitOf(name);
+      final freeF = _counted
+          ? Future.value(t['available'] as int? ?? 0)
+          : ApiService.availableNow(name);
+      final sample = await sampleF;
+      final free = await freeF;
       if (!mounted) return;
-      setState(() {
-        _items = [..._items, ...page.items];
-        _cursor = page.cursor ?? _cursor;
-        _hasMore = page.hasMore;
-        _loadingMore = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      // Keep what is already loaded; the next scroll retries.
-      setState(() => _loadingMore = false);
+      if (sample == null) {
+        _snack('$name is no longer in the inventory.');
+        _loadEquipment(refresh: true);
+        return;
+      }
+      await Navigator.push(
+          context,
+          MaterialPageRoute(
+              builder: (_) => EquipmentDetailScreen(
+                  equipment: sample,
+                  typeName: name,
+                  available: free,
+                  inLab: t['in_service'] as int?)));
+    } catch (_) {
+      if (mounted) _snack('Could not open $name. Check your connection and try again.');
+    } finally {
+      if (mounted) setState(() => _opening = '');
     }
   }
 
@@ -124,18 +134,9 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
 
   void _clearFilters() => setState(() => _selectedCategories.clear());
 
-  // Trailing row of the catalog list: paging spinner, an empty-result message,
-  // or a quiet end-of-list marker.
+  // Trailing row of the catalog list: an empty-result message, or a quiet
+  // end-of-list marker.
   Widget _listFooter(bool isEmpty) {
-    if (_loadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 20),
-        child: Center(
-          child: SizedBox(
-              width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)),
-        ),
-      );
-    }
     if (isEmpty) {
       return const Padding(
         padding: EdgeInsets.symmetric(vertical: 40),
@@ -147,41 +148,32 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
         ]),
       );
     }
-    if (!_hasMore) {
-      return const Padding(
-        padding: EdgeInsets.only(top: 16, bottom: 4),
-        child: Center(
-          child: Text('End of catalog',
-              style: TextStyle(fontSize: 11, color: AppTheme.textLight)),
-        ),
-      );
-    }
-    return const SizedBox(height: 4);
+    return const Padding(
+      padding: EdgeInsets.only(top: 16, bottom: 4),
+      child: Center(
+        child: Text('End of catalog',
+            style: TextStyle(fontSize: 11, color: AppTheme.textLight)),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final studentCourse = Session.course;
-    final filtered = _items.where((e) {
+    // The whole list is in hand, so every filter is exact (they used to run
+    // over the pages loaded so far).
+    final q = _search.trim().toLowerCase();
+    final filtered = _types.where((t) {
       final matchCat = _selectedCategories.isEmpty ||
-          _selectedCategories.contains(e['category']);
-      final matchSearch = _search.isEmpty ||
-          (e['equipment_name'] as String).toLowerCase().contains(_search.toLowerCase());
-      final itemCourses = (e['courses'] as List?)?.cast<String>() ?? [];
+          _selectedCategories.contains(t['category']);
+      final matchSearch = q.isEmpty || '${t['name']}'.toLowerCase().contains(q);
+      final itemCourses = (t['courses'] as List?)?.cast<String>() ?? [];
       final matchCourse = _showAllCourses ||
           studentCourse.isEmpty ||
           itemCourses.isEmpty ||
           itemCourses.contains(studentCourse);
       return matchCat && matchSearch && matchCourse;
     }).toList();
-
-    // Filters run over the pages loaded so far, so an active search or category
-    // can leave the screen looking empty while matches sit further down the
-    // collection. Pull the next page until there is enough to fill the list or
-    // the collection runs out.
-    if (filtered.length < _pageSize && _hasMore && !_loadingMore && !_loading) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
-    }
 
     return Scaffold(
       appBar: AppBar(title: const Text('Equipment Catalog')),
@@ -431,7 +423,7 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
                                   borderRadius: BorderRadius.circular(10),
                                 ),
                                 child: Text(
-                                  '${_items.where((e) => e['category'] == cat).length}',
+                                  '${_types.where((t) => t['category'] == cat).length}',
                                   style: TextStyle(
                                       fontSize: 11,
                                       color: checked
@@ -529,105 +521,100 @@ class _EquipmentCatalogScreenState extends State<EquipmentCatalogScreen> {
               ),
             ),
           Expanded(
-            child: ListView.separated(
-              controller: _scrollController,
-              padding: const EdgeInsets.all(16),
-              cacheExtent: 500,
-              // One extra row for the paging footer.
-              itemCount: filtered.length + 1,
-              separatorBuilder: (_, _) => const SizedBox(height: 10),
-              itemBuilder: (_, i) {
-                if (i == filtered.length) return _listFooter(filtered.isEmpty);
-                final e = filtered[i];
-                final isAvailable = (e['status'] ?? 'Available') == 'Available';
-                final category = e['category'] as String? ?? '';
-                return GestureDetector(
-                  onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                          builder: (_) => EquipmentDetailScreen(equipment: e))),
-                  child: Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border(
-                        left: BorderSide(
-                          color: isAvailable ? AppTheme.success : AppTheme.danger,
-                          width: 4,
+            child: RefreshIndicator(
+              onRefresh: () => _loadEquipment(refresh: true),
+              child: ListView.separated(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.all(16),
+                cacheExtent: 500,
+                // One extra row for the footer.
+                itemCount: filtered.length + 1,
+                separatorBuilder: (_, _) => const SizedBox(height: 10),
+                itemBuilder: (_, i) {
+                  if (i == filtered.length) return _listFooter(filtered.isEmpty);
+                  final t = filtered[i];
+                  final name = '${t['name']}';
+                  final category = '${t['category'] ?? ''}';
+                  final location = '${t['location'] ?? ''}';
+                  final count = t['in_service'] as int? ?? 0;
+                  final courses = (t['courses'] as List?)?.cast<String>() ?? const <String>[];
+                  final opening = _opening == name;
+                  return GestureDetector(
+                    onTap: () => _open(t),
+                    child: Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(16),
+                        border: const Border(
+                          left: BorderSide(color: AppTheme.success, width: 4),
                         ),
                       ),
-                    ),
-                    child: Row(
-                      children: [
-                        EquipmentThumb(
-                          bytes: photoThumbOf(e),
-                          category: category,
-                          color: isAvailable ? AppTheme.success : AppTheme.danger,
-                          size: 50,
-                        ),
-                        const SizedBox(width: 14),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(e['equipment_name'] as String,
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 14,
-                                      color: AppTheme.textDark)),
-                              const SizedBox(height: 2),
-                              Text('${e['qr_code']}  •  $category',
-                                  style: const TextStyle(
-                                      fontSize: 12,
-                                      color: AppTheme.textMid)),
-                              const SizedBox(height: 6),
-                              Row(
-                                children: [
-                                  StatusBadge(
-                                    label: e['status'] ?? 'Available',
-                                    color: isAvailable ? AppTheme.success : AppTheme.danger,
-                                  ),
-                                  if (e['location'] != null && e['location'].toString().isNotEmpty) ...[
-                                    const SizedBox(width: 6),
-                                    StatusBadge(label: e['location'], color: AppTheme.textMid),
-                                  ],
-                                ],
-                              ),
-                              if (((e['courses'] as List?)?.isNotEmpty ?? false)) ...[
-                                const SizedBox(height: 6),
-                                Row(children: [
-                                  const Icon(Icons.school_outlined,
-                                      size: 12, color: AppTheme.primary),
-                                  const SizedBox(width: 4),
-                                  Expanded(
-                                    child: Text(
-                                      'For: ${(e['courses'] as List).map((c) => courseLabel('$c')).join(', ')}',
-                                      style: const TextStyle(
-                                          fontSize: 11,
-                                          color: AppTheme.primary,
-                                          fontWeight: FontWeight.w600),
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  ),
-                                ]),
-                              ],
-                            ],
+                      child: Row(
+                        children: [
+                          EquipmentThumb(
+                            bytes: photoThumbOf(t),
+                            category: category,
+                            color: AppTheme.success,
+                            size: 50,
                           ),
-                        ),
-                        Icon(
-                            isAvailable
-                                ? Icons.arrow_forward_ios_rounded
-                                : Icons.block_rounded,
-                            size: 16,
-                            color: isAvailable
-                                ? AppTheme.accent
-                                : AppTheme.danger),
-                      ],
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(name,
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                        color: AppTheme.textDark)),
+                                const SizedBox(height: 2),
+                                Text(
+                                    joinParts([
+                                      _counted ? '$count available' : '$count in the lab',
+                                      category,
+                                    ]),
+                                    style: const TextStyle(
+                                        fontSize: 12,
+                                        color: AppTheme.textMid)),
+                                if (location.isNotEmpty) ...[
+                                  const SizedBox(height: 6),
+                                  StatusBadge(label: location, color: AppTheme.textMid),
+                                ],
+                                if (courses.isNotEmpty) ...[
+                                  const SizedBox(height: 6),
+                                  Row(children: [
+                                    const Icon(Icons.school_outlined,
+                                        size: 12, color: AppTheme.primary),
+                                    const SizedBox(width: 4),
+                                    Expanded(
+                                      child: Text(
+                                        'For: ${courses.map(courseLabel).join(', ')}',
+                                        style: const TextStyle(
+                                            fontSize: 11,
+                                            color: AppTheme.primary,
+                                            fontWeight: FontWeight.w600),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ]),
+                                ],
+                              ],
+                            ),
+                          ),
+                          if (opening)
+                            const SizedBox(
+                                width: 18, height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2))
+                          else
+                            const Icon(Icons.arrow_forward_ios_rounded,
+                                size: 16, color: AppTheme.accent),
+                        ],
+                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
           ),
         ],

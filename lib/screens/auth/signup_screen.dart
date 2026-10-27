@@ -123,7 +123,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
                 const Text('Account Created!', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: AppTheme.textDark)),
                 const SizedBox(height: 10),
                 Text(kDemoMode
-                        ? 'Welcome, ${_firstNameCtrl.text}! Your account is ready — you can sign in now with your student number and password.'
+                        ? 'Welcome, ${_firstNameCtrl.text}! Your account is ready — you can sign in now with your email and password.'
                         : 'Welcome, ${_firstNameCtrl.text}! A verification link has been sent to ${_emailCtrl.text.trim()}. Please check your inbox and verify your email before signing in.',
                     textAlign: TextAlign.center, style: const TextStyle(fontSize: 13, color: AppTheme.textMid)),
                 const SizedBox(height: 24),

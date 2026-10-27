@@ -4,8 +4,9 @@
 // Extracted from firstFile.dart on 2026-08-03 as step 7 of the module split.
 // -----------------------------------------------------------------------------
 
-import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -41,7 +42,10 @@ class _EquipmentRegistrationScreenState
   // value, so the form looked complete but failed validation with "Required".
   final _qtyCtrl = TextEditingController(text: '1');
 
-  XFile? _pickedImage;
+  // The picked photo's bytes, previewed with Image.memory: it works on the
+  // phone and in the web staff portal (Image.file has no file system on the
+  // web).
+  Uint8List? _pickedBytes;
   final _imagePicker = ImagePicker();
 
   String? _selectedCategory;
@@ -130,7 +134,9 @@ class _EquipmentRegistrationScreenState
   Future<void> _pickImage(ImageSource source) async {
     final picked = await _imagePicker.pickImage(
         source: source, imageQuality: 80, maxWidth: 1200);
-    if (picked != null) setState(() => _pickedImage = picked);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    if (mounted) setState(() => _pickedBytes = bytes);
   }
 
   Future<void> _confirmSave() async {
@@ -157,8 +163,8 @@ class _EquipmentRegistrationScreenState
       // Store the photo once the documents exist and their ids are known. The
       // units of one registration share it.
       String? photoError;
-      if (saved.isNotEmpty && _pickedImage != null) {
-        final bytes = await _pickedImage!.readAsBytes();
+      final bytes = _pickedBytes;
+      if (saved.isNotEmpty && bytes != null) {
         final stored = await ApiService.saveEquipmentPhotos(
             [for (final u in saved) u['equipment_id'] as String], bytes);
         photoError = stored.error;
@@ -232,7 +238,7 @@ class _EquipmentRegistrationScreenState
         key: _formKey,
         child: SingleChildScrollView(
           controller: _scrollCtrl,
-          padding: const EdgeInsets.fromLTRB(20, 20, 20, 40),
+          padding: readablePadding(context, const EdgeInsets.fromLTRB(20, 20, 20, 40), maxWidth: 900),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -278,12 +284,12 @@ class _EquipmentRegistrationScreenState
 
                 FieldLabel('Equipment Photo'),
                 const SizedBox(height: 8),
-                if (_pickedImage != null)
+                if (_pickedBytes != null)
                   Stack(children: [
                     ClipRRect(
                       borderRadius: BorderRadius.circular(12),
-                      child: Image.file(
-                        File(_pickedImage!.path),
+                      child: Image.memory(
+                        _pickedBytes!,
                         height: 160,
                         width: double.infinity,
                         fit: BoxFit.cover,
@@ -292,7 +298,7 @@ class _EquipmentRegistrationScreenState
                     Positioned(
                       top: 8, right: 8,
                       child: GestureDetector(
-                        onTap: () => setState(() => _pickedImage = null),
+                        onTap: () => setState(() => _pickedBytes = null),
                         child: Container(
                           padding: const EdgeInsets.all(4),
                           decoration: const BoxDecoration(
@@ -322,19 +328,23 @@ class _EquipmentRegistrationScreenState
                   ),
                 const SizedBox(height: 10),
                 Row(children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () => _pickImage(ImageSource.camera),
-                      icon: const Icon(Icons.camera_alt_outlined),
-                      label: const Text('Take Photo'),
+                  // A computer opens the same file picker for both, so the
+                  // web shows the one button.
+                  if (!kIsWeb) ...[
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () => _pickImage(ImageSource.camera),
+                        icon: const Icon(Icons.camera_alt_outlined),
+                        label: const Text('Take Photo'),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
+                    const SizedBox(width: 10),
+                  ],
                   Expanded(
                     child: OutlinedButton.icon(
                       onPressed: () => _pickImage(ImageSource.gallery),
                       icon: const Icon(Icons.photo_library_outlined),
-                      label: const Text('From Gallery'),
+                      label: Text(kIsWeb ? 'Choose Photo' : 'From Gallery'),
                     ),
                   ),
                 ]),

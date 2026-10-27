@@ -4,6 +4,7 @@
 // Extracted from firstFile.dart on 2026-08-03 as step 5 of the module split.
 // -----------------------------------------------------------------------------
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import '../staff/admin_dashboard_screen.dart';
 import '../student/home_screen.dart';
@@ -74,8 +75,9 @@ class _SplashScreenState extends State<SplashScreen>
         // Same e-mail verification gate as login(). A restored session must
         // never be the weaker door: an unverified account used to get in by
         // leaving a session behind from a failed Lab Staff sign-in and then
-        // relaunching (QA 2026-09-19, H3).
-        if (!ApiService.passesVerificationGate(studentDoc.data())) {
+        // relaunching (QA 2026-09-19, H3). The web build is the staff portal,
+        // so a student session is never restored there either.
+        if (kIsWeb || !ApiService.passesVerificationGate(studentDoc.data())) {
           await ApiService.signOut();
           _goLogin();
           return;

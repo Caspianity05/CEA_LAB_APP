@@ -33,13 +33,10 @@ class _AdminPenaltiesScreenState extends State<AdminPenaltiesScreen> {
     setState(() => _loading = true);
     try {
       final held = await ApiService.getHeldStudents();
-      final reqs = await ApiService.getRequests();
-      final now = DateTime.now();
-      final overdue = reqs.where((e) {
-        if (e['status'] != 'Approved') return false;
-        final due = DateTime.tryParse('${e['due_date']}'.replaceAll(' ', 'T'));
-        return due != null && due.isBefore(now);
-      }).toList();
+      // Only approved records can be overdue, so only those are read; and an
+      // approved item still waiting at the lab is not overdue (2026-10-06).
+      final reqs = await ApiService.getRequests(status: 'Approved');
+      final overdue = ApiService.overdueLoans(reqs);
       if (!mounted) return;
       setState(() { _held = held; _overdue = overdue; _loading = false; });
     } catch (_) {
@@ -69,22 +66,25 @@ class _AdminPenaltiesScreenState extends State<AdminPenaltiesScreen> {
           ? const Center(child: CircularProgressIndicator())
           : RefreshIndicator(
               onRefresh: _load,
-              child: ListView(padding: const EdgeInsets.all(16), children: [
-                const SectionHeader(title: 'Students on Hold'),
-                const SizedBox(height: 10),
-                if (_held.isEmpty)
-                  _penaltyEmpty('No students are currently on hold.')
-                else
-                  ..._held.map(_holdCard),
-                const SizedBox(height: 24),
-                const SectionHeader(title: 'Overdue Loans'),
-                const SizedBox(height: 10),
-                if (_overdue.isEmpty)
-                  _penaltyEmpty('No overdue loans.')
-                else
-                  ..._overdue.map(_overdueCard),
-                const SizedBox(height: 20),
-              ]),
+              // Both lists put their cards in rows on a wide window (gridRows).
+              child: LayoutBuilder(
+                builder: (context, box) => ListView(padding: const EdgeInsets.all(16), children: [
+                  const SectionHeader(title: 'Students on Hold'),
+                  const SizedBox(height: 10),
+                  if (_held.isEmpty)
+                    _penaltyEmpty('No students are currently on hold.')
+                  else
+                    ...gridRows([..._held.map(_holdCard)], gridColumns(box.maxWidth - 32)),
+                  const SizedBox(height: 24),
+                  const SectionHeader(title: 'Overdue Loans'),
+                  const SizedBox(height: 10),
+                  if (_overdue.isEmpty)
+                    _penaltyEmpty('No overdue loans.')
+                  else
+                    ...gridRows([..._overdue.map(_overdueCard)], gridColumns(box.maxWidth - 32)),
+                  const SizedBox(height: 20),
+                ]),
+              ),
             ),
     );
   }

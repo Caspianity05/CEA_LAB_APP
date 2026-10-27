@@ -2,16 +2,25 @@
 // LabTrack - staff: admin inventory screen
 //
 // Extracted from firstFile.dart on 2026-08-03 as step 7 of the module split.
+//
+// 1.0.19 (2026-10-15): with the item-type list built, a search or a category
+// reads only the units of the matching types (a QR code, only the matching
+// codes) instead of paging through all 1,067 units until enough matched. The
+// plain list still pages 20 at a time. Managers can rebuild the type list here.
 // -----------------------------------------------------------------------------
 
-import 'dart:io';
+import 'dart:async';
+import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../constants.dart';
 import '../../services/api_service.dart';
+import '../../services/file_download.dart';
+import '../../services/qr_labels.dart';
 import '../../services/session.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
@@ -37,6 +46,8 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   // list, so staff saw an empty box and "No equipment found" (found on the
   // phone, 2026-10-05).
   final _searchCtrl = TextEditingController();
+  // 1.0.19: with the item-type list the category goes through the matching
+  // types (see _startFind), so the note below only applies before it exists.
   // TODO(scalability): this category filter is single-select, so unlike the
   // student catalog's multi-select it COULD run server-side as
   //   .where('category', isEqualTo: _filter).orderBy('equipment_name')
@@ -62,6 +73,22 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   int _availableItems = 0;
   int _borrowedItems  = 0;
 
+  // The item-type list (1.0.19); null until a manager builds it.
+  List<Map<String, dynamic>>? _types;
+  // The filtered view: types still to load, the units found so far, and the
+  // search + category they belong to (a slower answer to an older search is
+  // dropped).
+  List<String> _queue = [];
+  List<Map<String, dynamic>> _found = [];
+  bool _finding = false;
+  String _foundKey = '';
+  Timer? _debounce;
+  bool _rebuilding = false;
+
+  bool get _filtering => _search.trim().isNotEmpty || _filter != 'All';
+  bool get _byType => _types != null && _filtering;
+  String get _findKey => '$_filter|${_search.trim().toLowerCase()}';
+
   @override
   void initState() {
     super.initState();
@@ -71,6 +98,7 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _searchCtrl.dispose();
@@ -80,7 +108,116 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   void _onScroll() {
     if (!_scrollController.hasClients) return;
     final pos = _scrollController.position;
-    if (pos.pixels >= pos.maxScrollExtent - 400) _loadMore();
+    if (pos.pixels >= pos.maxScrollExtent - 400) {
+      if (_byType) {
+        _findMore();
+      } else {
+        _loadMore();
+      }
+    }
+  }
+
+  // The type names the search and category point to, in name order.
+  List<String> _matchingTypes() => ApiService.typesMatching([
+        for (final t in _types ?? const <Map<String, dynamic>>[])
+          if (_filter == 'All' || t['category'] == _filter) '${t['name']}',
+      ], _search);
+
+  void _scheduleFind() {
+    _debounce?.cancel();
+    if (!_byType) return;
+    _debounce = Timer(const Duration(milliseconds: 350), _startFind);
+  }
+
+  // A new search or category: the matching QR codes, or the units of the
+  // matching types, a screenful at a time.
+  Future<void> _startFind() async {
+    if (!_byType) return;
+    final key = _findKey;
+    final q = _search.trim();
+    setState(() { _foundKey = key; _found = []; _queue = []; _finding = true; });
+    try {
+      if (q.isNotEmpty && ApiService.looksLikeQrCode(q)) {
+        final units = await ApiService.unitsByQrCode(q);
+        if (!mounted || _foundKey != key) return;
+        setState(() {
+          _found = units.where(_matches).toList();
+          _finding = false;
+        });
+        return;
+      }
+      _queue = _matchingTypes();
+      await _findMore(key);
+    } catch (_) {
+      if (mounted && _foundKey == key) setState(() => _finding = false);
+    }
+  }
+
+  // The units of the next matching types: about a screenful, by the counts in
+  // the type list, at most 30 types a query.
+  Future<void> _findMore([String? key]) async {
+    final k = key ?? _foundKey;
+    if (key == null && (_finding || !_byType)) return;
+    if (_queue.isEmpty) {
+      if (mounted) setState(() => _finding = false);
+      return;
+    }
+    final units = {for (final t in _types!) '${t['name']}': t['units'] as int? ?? 1};
+    final next = <String>[];
+    var expected = 0;
+    while (_queue.isNotEmpty && next.length < 30 && expected < _pageSize) {
+      final name = _queue.removeAt(0);
+      next.add(name);
+      expected += units[name] ?? 1;
+    }
+    setState(() => _finding = true);
+    try {
+      final loaded = await ApiService.unitsOfTypes(next);
+      if (!mounted || _foundKey != k) return;
+      setState(() {
+        _found = [..._found, ...loaded.where(_matches)];
+        _finding = false;
+      });
+    } catch (_) {
+      if (!mounted || _foundKey != k) return;
+      // Put them back so scrolling again retries.
+      setState(() { _queue = [...next, ..._queue]; _finding = false; });
+    }
+  }
+
+  // Rebuilds the item-type list from every record (1.0.19). Needed once to
+  // switch the lists over, after an import, or if a count ever looks wrong.
+  Future<void> _rebuild() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.sync_rounded, color: AppTheme.primary, size: 40),
+        title: const Text('Rebuild the item list?'),
+        content: Text(
+            'Reads all $_totalItems equipment records once to rebuild the list of '
+            'item types that students borrow from, and gives each record its type.\n\n'
+            'Do this the first time, after importing equipment, or if a count looks wrong.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Rebuild')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _rebuilding = true);
+    final res = await ApiService.rebuildItemTypes();
+    if (!mounted) return;
+    setState(() => _rebuilding = false);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(res['success'] == true
+          ? 'Item list rebuilt: ${res['types']} types from ${res['units']} records'
+              '${(res['backfilled'] as int? ?? 0) > 0 ? ' (${res['backfilled']} records given their type)' : ''}.'
+          : 'Could not rebuild the item list: ${res['message'] ?? 'unknown error'}'),
+      backgroundColor: res['success'] == true ? AppTheme.success : AppTheme.danger,
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 6),
+    ));
+    if (res['success'] == true) _load();
   }
 
   Future<void> _load() async {
@@ -92,11 +229,15 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
       _hasMore = true;
     });
     try {
-      // Both start before either is awaited, so they run concurrently.
+      // All start before any is awaited, so they run concurrently. The type
+      // list is one read, or none while it is cached.
       final pageFuture   = ApiService.getEquipmentPage(limit: _pageSize);
       final countsFuture = ApiService.getEquipmentCounts();
+      final typesFuture  = ApiService.getItemTypes()
+          .then<List<Map<String, dynamic>>?>((t) => t, onError: (_) => null);
       final page   = await pageFuture;
       final counts = await countsFuture;
+      final types  = await typesFuture;
       if (!mounted) return;
       setState(() {
         _equipment = page.items;
@@ -105,8 +246,10 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
         _totalItems = counts.total;
         _availableItems = counts.available;
         _borrowedItems  = counts.borrowed;
+        _types = types;
         _loading = false;
       });
+      if (_byType) _startFind();
     } catch (_) {
       if (!mounted) return;
       setState(() { _loading = false; _hasError = true; });
@@ -133,10 +276,143 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
     }
   }
 
+  Widget _categoryChips() => SizedBox(
+        height: 32,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: _categories.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 8),
+          itemBuilder: (_, i) {
+            final c = _categories[i];
+            final sel = _filter == c;
+            return GestureDetector(
+              onTap: () {
+                setState(() => _filter = c);
+                _scheduleFind();
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 160),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                decoration: BoxDecoration(
+                  color: sel ? AppTheme.accent : const Color(0x1AFFFFFF),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(c,
+                    style: TextStyle(
+                        color: sel ? AppTheme.primary : AppTheme.textLight,
+                        fontSize: 12,
+                        fontWeight: sel ? FontWeight.bold : FontWeight.normal)),
+              ),
+            );
+          },
+        ),
+      );
+
+  // ── QR labels (web portal, 2026-10-06) ──
+  // A PDF of label sheets for every item the category and search show. The
+  // list on screen is paged, so the matching units are read in full, only when
+  // staff ask: with the type list (1.0.19) just those of the matching types or
+  // codes; without it, or with no filter, the whole inventory.
+  bool _makingLabels = false;
+
+  bool _matches(Map<String, dynamic> e) {
+    final q = _search.toLowerCase();
+    return (_filter == 'All' || e['category'] == _filter) &&
+        (q.isEmpty ||
+            '${e['equipment_name'] ?? ''}'.toLowerCase().contains(q) ||
+            '${e['qr_code'] ?? ''}'.toLowerCase().contains(q));
+  }
+
+  Future<void> _qrLabels() async {
+    setState(() => _makingLabels = true);
+    try {
+      final q = _search.trim();
+      final source = !_byType
+          ? await ApiService.getAllEquipment()
+          : q.isNotEmpty && ApiService.looksLikeQrCode(q)
+              ? await ApiService.unitsByQrCode(q)
+              : await ApiService.unitsOfTypes(_matchingTypes());
+      final items = source.where(_matches).toList();
+      if (!mounted) return;
+      if (items.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('No items match the filters.'),
+            behavior: SnackBarBehavior.floating));
+        return;
+      }
+      // Only items with a QR code get a label (QrLabels.withCode); the rest
+      // are named, so the count matches the PDF (2026-10-07).
+      final labelled = QrLabels.withCode(items);
+      final noCode = [
+        for (final e in items)
+          if (!labelled.contains(e)) '${e['equipment_name'] ?? 'Unnamed'}',
+      ];
+      if (labelled.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('None of these items has a QR code, so there is nothing to print.'),
+            behavior: SnackBarBehavior.floating));
+        return;
+      }
+      final which = [
+        if (_filter != 'All') _filter,
+        if (_search.isNotEmpty) 'matching "$_search"',
+      ].join(', ');
+      final pages = QrLabels.pages(labelled.length);
+      final leftOut = noCode.isEmpty
+          ? ''
+          : '\n\n${noCode.length == 1 ? '1 item has' : '${noCode.length} items have'} '
+              'no QR code and ${noCode.length == 1 ? 'is' : 'are'} left out: '
+              '${noCode.take(3).join(', ')}'
+              '${noCode.length > 3 ? ' and ${noCode.length - 3} more' : ''}.';
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          icon: const Icon(Icons.qr_code_2_rounded, color: AppTheme.primary, size: 40),
+          title: const Text('QR labels'),
+          content: Text(
+              'A PDF of ${labelled.length} labels${which.isEmpty ? '' : ' ($which)'}: '
+              '${QrLabels.perPage} per A4 sheet, $pages ${pages == 1 ? 'sheet' : 'sheets'}.'
+              '$leftOut\n\n'
+              'Print at 100% ("Actual size"), cut along the grey lines, and stick '
+              'each label on its unit.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(
+                onPressed: () => Navigator.pop(ctx, true), child: const Text('Download PDF')),
+          ],
+        ),
+      );
+      if (go != true || !mounted) return;
+      final bytes = await QrLabels.build(labelled);
+      final now = DateTime.now();
+      String two(int n) => n.toString().padLeft(2, '0');
+      final ok = downloadBytes(
+          'labtrack-qr-labels-${now.year}-${two(now.month)}-${two(now.day)}.pdf', bytes,
+          mimeType: 'application/pdf');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(ok
+            ? 'Downloaded ${labelled.length} labels.'
+            : 'Labels can be downloaded from the web portal.'),
+        backgroundColor: ok ? AppTheme.success : AppTheme.danger,
+        behavior: SnackBarBehavior.floating,
+      ));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Could not make the labels. Try again.'),
+          backgroundColor: AppTheme.danger,
+          behavior: SnackBarBehavior.floating));
+    } finally {
+      if (mounted) setState(() => _makingLabels = false);
+    }
+  }
+
   Color _conditionColor(String c) {
     switch (c) {
       case 'Available': return AppTheme.success;
       case 'Borrowed':  return AppTheme.warning;
+      case 'Reserved':  return AppTheme.accent;
       default:          return AppTheme.textMid;
     }
   }
@@ -151,7 +427,7 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
   // Trailing row of the inventory list: paging spinner, empty-result message,
   // or a quiet end-of-list marker.
   Widget _listFooter(bool isEmpty) {
-    if (_loadingMore) {
+    if (_byType ? _finding : _loadingMore) {
       return const Padding(
         padding: EdgeInsets.symmetric(vertical: 20),
         child: Center(
@@ -171,7 +447,7 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
         ]),
       );
     }
-    if (!_hasMore) {
+    if (!(_byType ? _queue.isNotEmpty : _hasMore)) {
       return const Padding(
         padding: EdgeInsets.only(top: 16),
         child: Center(
@@ -232,6 +508,89 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
     if (res['success'] == true) _load();
   }
 
+  // One equipment card: a list row on a phone, one cell of a grid row on a
+  // wide window.
+  Widget _itemCard(Map<String, dynamic> e) {
+    final status = e['status'] ?? 'Available';
+    final condColor = _conditionColor(status);
+
+    return GestureDetector(
+      onTap: () => Navigator.push(context,
+          MaterialPageRoute(
+              builder: (_) => EquipmentDetailScreen(equipment: e))),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border(left: BorderSide(color: condColor, width: 4)),
+        ),
+        child: Row(
+          children: [
+            _thumb(e, condColor),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(e['equipment_name'] as String,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
+                  const SizedBox(height: 2),
+                  Text(joinParts([e['qr_code'], e['category']], separator: '  ·  '),
+                      style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+                  if (ApiService.asDate(e['created_at']) case final added?) ...[
+                    const SizedBox(height: 2),
+                    Text('Added ${formatDate(added)}',
+                        style: const TextStyle(fontSize: 11, color: AppTheme.textLight)),
+                  ],
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    // Stretched across a browser-wide card the
+                    // badge read as a progress bar, so the web
+                    // keeps it to its text.
+                    if (kIsWeb)
+                      Flexible(child: StatusBadge(label: status, color: condColor))
+                    else
+                      Expanded(child: StatusBadge(label: status, color: condColor)),
+                    const SizedBox(width: 12),
+                    StatusBadge(label: e['category'] as String, color: AppTheme.primary),
+                  ]),
+                ],
+              ),
+            ),
+            const SizedBox(width: 4),
+            if (Session.canManage)
+              PopupMenuButton<String>(
+                onSelected: (v) {
+                  if (v == 'edit') _openEdit(e);
+                  if (v == 'delete') _confirmDelete(e);
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'edit',
+                    child: Row(children: [
+                      Icon(Icons.edit_outlined, size: 18, color: AppTheme.textMid),
+                      SizedBox(width: 8),
+                      Text('Edit Details'),
+                    ]),
+                  ),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Row(children: [
+                      Icon(Icons.delete_outline_rounded, size: 18, color: AppTheme.danger),
+                      SizedBox(width: 8),
+                      Text('Delete', style: TextStyle(color: AppTheme.danger)),
+                    ]),
+                  ),
+                ],
+                child: const Icon(Icons.more_vert_rounded, color: AppTheme.textLight),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
@@ -274,11 +633,25 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
     // things were actually out (QA 2026-09-19, low #6).
     final borrowedItems = _borrowedItems;
 
-    // An active search or category can hide everything loaded so far while
-    // matches remain further down the collection; pull more until the list
-    // fills or the inventory runs out.
-    if (filtered.length < _pageSize && _hasMore && !_loadingMore && !_loading) {
+    // With the type list, a search or category shows the units found for it
+    // (1.0.19); otherwise the pages loaded so far, filtered.
+    final shown = _byType ? _found : filtered;
+
+    if (_byType) {
+      // Fill the screen from the next matching types.
+      if (_found.length < _pageSize && _queue.isNotEmpty && !_finding && !_loading) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => _findMore());
+      }
+    } else if (filtered.length < _pageSize && _hasMore && !_loadingMore && !_loading) {
+      // An active search or category can hide everything loaded so far while
+      // matches remain further down the collection; pull more until the list
+      // fills or the inventory runs out. (Only before the type list exists.)
       WidgetsBinding.instance.addPostFrameCallback((_) => _loadMore());
+    }
+    // Four cards a row on a wide window can leave a page too short to scroll,
+    // and then no scroll ever asks for the next one; check once laid out.
+    if (_hasMore && !_loadingMore && !_loading) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _onScroll());
     }
 
     return Scaffold(
@@ -305,7 +678,10 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
                 // Search bar
                 TextField(
                   controller: _searchCtrl,
-                  onChanged: (v) => setState(() => _search = v),
+                  onChanged: (v) {
+                    setState(() => _search = v);
+                    _scheduleFind();
+                  },
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     hintText: 'Search by name or ID...',
@@ -320,126 +696,79 @@ class _AdminInventoryScreenState extends State<AdminInventoryScreen> {
                   ),
                 ),
                 const SizedBox(height: 10),
-                // Category filter chips
-                SizedBox(
-                  height: 32,
-                  child: ListView.separated(
-                    scrollDirection: Axis.horizontal,
-                    itemCount: _categories.length,
-                    separatorBuilder: (_, _) => const SizedBox(width: 8),
-                    itemBuilder: (_, i) {
-                      final c = _categories[i];
-                      final sel = _filter == c;
-                      return GestureDetector(
-                        onTap: () => setState(() => _filter = c),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 160),
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: sel ? AppTheme.accent : const Color(0x1AFFFFFF),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(c,
-                              style: TextStyle(
-                                  color: sel ? AppTheme.primary : AppTheme.textLight,
-                                  fontSize: 12,
-                                  fontWeight: sel ? FontWeight.bold : FontWeight.normal)),
-                        ),
-                      );
-                    },
-                  ),
-                ),
+                // Category filter chips, and on the web portal the QR-label
+                // sheets for what the filters show (2026-10-06).
+                Row(children: [
+                  Expanded(child: _categoryChips()),
+                  if (kIsWeb) ...[
+                    const SizedBox(width: 8),
+                    TextButton.icon(
+                      onPressed: _makingLabels ? null : _qrLabels,
+                      icon: _makingLabels
+                          ? const SizedBox(
+                              width: 14, height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.qr_code_2_rounded, color: Colors.white, size: 18),
+                      label: const Text('QR labels',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                    ),
+                  ],
+                  // Rebuild the item-type list (1.0.19), managers only.
+                  if (Session.canManage)
+                    IconButton(
+                      tooltip: 'Rebuild item list',
+                      onPressed: _rebuilding ? null : _rebuild,
+                      icon: _rebuilding
+                          ? const SizedBox(
+                              width: 16, height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.sync_rounded, color: Colors.white, size: 20),
+                    ),
+                ]),
               ],
             ),
           ),
 
-          // ── Equipment list ──
-          Expanded(
-            child: ListView.separated(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
-                    // One extra row for the paging footer.
-                    itemCount: filtered.length + 1,
-                    separatorBuilder: (_, _) => const SizedBox(height: 10),
-                    itemBuilder: (_, i) {
-                      if (i == filtered.length) {
-                        return _listFooter(filtered.isEmpty);
-                      }
-                      final e = filtered[i];
-                      final status = e['status'] ?? 'Available';
-                      final condColor = _conditionColor(status);
+          // Until the item-type list is built, students' lists read every
+          // unit (1.0.19); say so to the people who can build it.
+          if (_types == null && Session.canManage)
+            Container(
+              width: double.infinity,
+              color: const Color(0x1AF5A623),
+              padding: const EdgeInsets.fromLTRB(16, 10, 8, 10),
+              child: Row(children: [
+                const Icon(Icons.info_outline_rounded, color: AppTheme.warning, size: 18),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                      "The item list isn't set up yet, so the student catalog and borrow "
+                      'form read every unit. Build it once to make them fast and cheap.',
+                      style: TextStyle(fontSize: 12, color: AppTheme.textDark)),
+                ),
+                TextButton(
+                    onPressed: _rebuilding ? null : _rebuild,
+                    child: const Text('Build now')),
+              ]),
+            ),
 
-                      return GestureDetector(
-                        onTap: () => Navigator.push(context,
-                            MaterialPageRoute(
-                                builder: (_) => EquipmentDetailScreen(equipment: e))),
-                        child: Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border(left: BorderSide(color: condColor, width: 4)),
-                          ),
-                          child: Row(
-                            children: [
-                              _thumb(e, condColor),
-                              const SizedBox(width: 14),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(e['equipment_name'] as String,
-                                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
-                                    const SizedBox(height: 2),
-                                    Text('${e['qr_code']}  ·  ${e['category']}',
-                                        style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
-                                    if (ApiService.asDate(e['created_at']) case final added?) ...[
-                                      const SizedBox(height: 2),
-                                      Text('Added ${formatDate(added)}',
-                                          style: const TextStyle(fontSize: 11, color: AppTheme.textLight)),
-                                    ],
-                                    const SizedBox(height: 8),
-                                    Row(children: [
-                                      Expanded(child: StatusBadge(label: status, color: condColor)),
-                                      const SizedBox(width: 12),
-                                      StatusBadge(label: e['category'] as String, color: AppTheme.primary),
-                                    ]),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: 4),
-                              if (Session.canManage)
-                                PopupMenuButton<String>(
-                                  onSelected: (v) {
-                                    if (v == 'edit') _openEdit(e);
-                                    if (v == 'delete') _confirmDelete(e);
-                                  },
-                                  itemBuilder: (_) => const [
-                                    PopupMenuItem(
-                                      value: 'edit',
-                                      child: Row(children: [
-                                        Icon(Icons.edit_outlined, size: 18, color: AppTheme.textMid),
-                                        SizedBox(width: 8),
-                                        Text('Edit Details'),
-                                      ]),
-                                    ),
-                                    PopupMenuItem(
-                                      value: 'delete',
-                                      child: Row(children: [
-                                        Icon(Icons.delete_outline_rounded, size: 18, color: AppTheme.danger),
-                                        SizedBox(width: 8),
-                                        Text('Delete', style: TextStyle(color: AppTheme.danger)),
-                                      ]),
-                                    ),
-                                  ],
-                                  child: const Icon(Icons.more_vert_rounded, color: AppTheme.textLight),
-                                ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+          // ── Equipment list ──
+          // Rows of cards on a wide window, one card per row on a phone.
+          Expanded(
+            child: LayoutBuilder(builder: (context, box) {
+              final cols = gridColumns(box.maxWidth - 32, minWidth: 400);
+              final rows = (shown.length + cols - 1) ~/ cols;
+              return ListView.separated(
+                controller: _scrollController,
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
+                // One extra row for the paging footer.
+                itemCount: rows + 1,
+                separatorBuilder: (_, _) => const SizedBox(height: 10),
+                itemBuilder: (_, i) {
+                  if (i == rows) return _listFooter(shown.isEmpty);
+                  return gridRow(i, cols, shown.length, (j) => _itemCard(shown[j]));
+                },
+              );
+            }),
           ),
         ],
       ),
@@ -499,12 +828,19 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
   late String? _selectedCategory;
   late String _selectedStatus;
   late List<String> _selectedCourses;
-  XFile? _pickedImage;
+  // The picked photo's bytes: Image.memory works on the phone and on the web
+  // (Image.file has no file system in a browser).
+  Uint8List? _pickedBytes;
   bool _saving = false;
 
   final _imagePicker = ImagePicker();
   final _statuses    = kStatuses;
   final _categories  = kCategories;
+
+  // Out on a loan right now (see the Status picker).
+  bool get _onLoan => widget.equipment['status'] == 'Borrowed';
+  // Held for a student's pending request (2026-10-06).
+  bool get _reserved => widget.equipment['status'] == 'Reserved';
 
   @override
   void initState() {
@@ -534,7 +870,9 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
   Future<void> _pickImage(ImageSource source) async {
     final picked = await _imagePicker.pickImage(
         source: source, imageQuality: 80, maxWidth: 1200);
-    if (picked != null) setState(() => _pickedImage = picked);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    if (mounted) setState(() => _pickedBytes = bytes);
   }
 
   // "Added to the inventory on Oct 2, 2026 by Ramoel Bello". Records made
@@ -556,15 +894,19 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
     setState(() => _saving = true);
     try {
       String? photoError;
-      if (_pickedImage != null) {
-        final bytes = await _pickedImage!.readAsBytes();
+      final bytes = _pickedBytes;
+      if (bytes != null) {
         final saved = await ApiService.saveEquipmentPhoto(equipmentId, bytes);
         photoError = saved.error;
       }
       final res = await ApiService.updateEquipment(equipmentId, {
         'equipment_name': _nameCtrl.text.trim(),
         'category':       _selectedCategory ?? widget.equipment['category'],
-        'status':         _selectedStatus,
+        // Only a status staff changed here. Saving other details used to
+        // write back the status the form opened with, so an item approved,
+        // returned or reserved meanwhile went back to the old one.
+        if (_selectedStatus != (widget.equipment['status'] ?? 'Available'))
+          'status':       _selectedStatus,
         'location':       _locationCtrl.text.trim(),
         'brand':          _brandCtrl.text.trim(),
         'model':          _modelCtrl.text.trim(),
@@ -680,17 +1022,17 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                 // Photo picker
                 FieldLabel('Equipment Photo'),
                 const SizedBox(height: 8),
-                if (_pickedImage != null)
+                if (_pickedBytes != null)
                   Stack(children: [
                     ClipRRect(
                       borderRadius: BorderRadius.circular(12),
-                      child: Image.file(File(_pickedImage!.path),
+                      child: Image.memory(_pickedBytes!,
                           height: 160, width: double.infinity, fit: BoxFit.cover),
                     ),
                     Positioned(
                       top: 8, right: 8,
                       child: GestureDetector(
-                        onTap: () => setState(() => _pickedImage = null),
+                        onTap: () => setState(() => _pickedBytes = null),
                         child: Container(
                           padding: const EdgeInsets.all(4),
                           decoration: const BoxDecoration(
@@ -728,19 +1070,23 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                   ),
                 const SizedBox(height: 10),
                 Row(children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () => _pickImage(ImageSource.camera),
-                      icon: const Icon(Icons.camera_alt_outlined),
-                      label: const Text('Take Photo'),
+                  // A computer opens the same file picker for both, so the
+                  // web shows the one button.
+                  if (!kIsWeb) ...[
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () => _pickImage(ImageSource.camera),
+                        icon: const Icon(Icons.camera_alt_outlined),
+                        label: const Text('Take Photo'),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
+                    const SizedBox(width: 10),
+                  ],
                   Expanded(
                     child: OutlinedButton.icon(
                       onPressed: () => _pickImage(ImageSource.gallery),
                       icon: const Icon(Icons.photo_library_outlined),
-                      label: const Text('From Gallery'),
+                      label: Text(kIsWeb ? 'Choose Photo' : 'From Gallery'),
                     ),
                   ),
                 ]),
@@ -757,17 +1103,48 @@ class _EditEquipmentSheetState extends State<_EditEquipmentSheet> {
                           color: Colors.white,
                           borderRadius: BorderRadius.circular(12),
                           border: Border.all(color: AppTheme.divider)),
+                      // "Borrowed" belongs to a loan: only an approval sets it
+                      // and only a return clears it. Picking it here left an
+                      // item out with no loan to return, and picking anything
+                      // else for an item on loan orphaned the loan (QA
+                      // 2026-10-06). So it is never offered, and an item on
+                      // loan keeps it until it comes back.
                       child: DropdownButtonHideUnderline(
                         child: DropdownButton<String>(
                           isExpanded: true,
                           value: _selectedStatus,
-                          items: _statuses.map((s) => DropdownMenuItem(
-                              value: s,
-                              child: Text(s, style: const TextStyle(fontSize: 13)))).toList(),
-                          onChanged: (v) => setState(() => _selectedStatus = v!),
+                          // "Reserved" works the same way: a request sets it
+                          // and deciding or cancelling the request clears it.
+                          // It is listed only for the item that has it.
+                          items: (_onLoan
+                                  ? const ['Borrowed']
+                                  : [
+                                      if (_reserved) 'Reserved',
+                                      ..._statuses.where((s) => s != 'Borrowed'),
+                                    ])
+                              .map((s) => DropdownMenuItem(
+                                  value: s,
+                                  child: Text(s, style: const TextStyle(fontSize: 13))))
+                              .toList(),
+                          onChanged: _onLoan
+                              ? null
+                              : (v) => setState(() => _selectedStatus = v!),
                         ),
                       ),
                     ),
+                    if (_onLoan)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 4),
+                        child: Text('On loan. Its return will change this.',
+                            style: TextStyle(fontSize: 11, color: AppTheme.textMid)),
+                      ),
+                    if (_reserved)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 4),
+                        child: Text('Held for a pending request. Approving or '
+                            'rejecting it will change this.',
+                            style: TextStyle(fontSize: 11, color: AppTheme.textMid)),
+                      ),
                   ])),
                   const SizedBox(width: 12),
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [

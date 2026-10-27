@@ -52,6 +52,13 @@ const bool kDemoMode = false;
 // ─────────────────────────────────────────────────────────────────────────────
 final DateTime kLegacyAccountCutoff = DateTime.utc(2026, 8, 3);
 
+// What a student sees after typing a student number into the login field.
+// Students sign in with their email since 2026-10-13 (see login()). The demo
+// accounts do too: login never checks the address's domain, and the
+// grandfather clause above still lets them skip verification.
+const String kStudentIdLoginMessage =
+    'Sign in with your email address, not your student ID.';
+
 /// True if [profile] belongs to an account created before demo mode was closed.
 bool _isLegacyAccount(Map<String, dynamic>? profile) {
   final ts = profile?['created_at'];
@@ -131,25 +138,15 @@ class ApiService {
       String identifier, String password, String role) async {
     try {
       if (role == 'student') {
-        // The field is labelled "Student ID / Email", so both have to work. An
-        // address used to be sent to the lookup index and bounce with "Student
-        // ID not found." (QA 2026-09-19, M7); anything containing '@' is now
-        // taken as the e-mail itself and skips the lookup.
-        String email;
-        if (identifier.contains('@')) {
-          email = identifier;
-        } else {
-          // Students sign in with their student number. Resolve it to an email
-          // via the public lookup index — this works BEFORE authentication,
-          // unlike a query on the protected `students` collection (see
-          // firestore.rules).
-          final lookup =
-              await _db.collection('student_lookup').doc(identifier).get();
-          if (!lookup.exists) {
-            return {'success': false, 'message': 'Student ID not found.'};
-          }
-          email = lookup.data()!['email'] as String;
+        // Students sign in with their email (2026-10-13). A student number
+        // used to work too, resolved to the email through a lookup index that
+        // anyone could read before signing in, which let a guessed number
+        // reveal a student's email (pen test R3). The index is closed now, so
+        // a number gets a plain answer instead of a permission error.
+        if (!identifier.contains('@')) {
+          return {'success': false, 'message': kStudentIdLoginMessage};
         }
+        final email = identifier;
         await _auth.signInWithEmailAndPassword(email: email, password: password);
         final uid = _auth.currentUser!.uid;
         // Profile is read BEFORE the verification gate: the grandfather check
@@ -320,16 +317,16 @@ class ApiService {
         await batch.commit();
       } on FirebaseException catch (e) {
         if (e.code != 'permission-denied') rethrow;
-        // Refused. The usual reason is a number someone already registered,
-        // but the rules also check the profile itself, so only say "already
-        // registered" when that is actually true.
+        // Refused. The form already checks everything else the rules check
+        // (NEU address, name, course, number format), so the usual reason is
+        // a number someone already registered. The lookup index can no longer
+        // be read to confirm that (2026-10-13, pen test R3), so say it as
+        // the likely reason rather than a certainty.
         await cred.user!.delete();
-        final taken = await lookupRef.get().then((d) => d.exists, onError: (_) => false);
         return {
           'success': false,
-          'message': taken
-              ? 'Student ID is already registered.'
-              : 'Registration was refused. Please check your details and try again.',
+          'message': 'Registration was refused. This student ID may already '
+              'be registered. If it is yours, please ask the laboratory staff.',
         };
       }
 
@@ -441,6 +438,7 @@ class ApiService {
       // cannot keep acting as the signed-in user.
     }
     Session.clear();
+    forgetItemTypes();
   }
 
   // ── Equipment ─────────────────────────────────────────────────────────────
@@ -685,13 +683,26 @@ class ApiService {
         : equipmentStatusForCondition(condition);
     final saved = <Map<String, dynamic>>[];
     try {
+      final keepList = await _keepingTypeList();
       for (var i = 0; i < units.length; i += 8) {
         final batch = _db.batch();
         final part = <Map<String, dynamic>>[];
+        final deltas = <Map<String, Map<String, dynamic>>>[];
         for (final unit in units.skip(i).take(8)) {
           final ref = _db.collection('equipment').doc();
+          final courses = (data['courses'] as List?)?.cast<String>() ?? <String>[];
+          // The type list follows every unit written (1.0.19), in the same
+          // batch: 8 units + the list stay inside a batch's 20 rule reads.
+          deltas.add(typeDelta(null, {
+            'equipment_name': unit['equipment_name'],
+            'status':         status,
+            'category':       data['category'],
+            'location':       data['location'] ?? '',
+            'courses':        courses,
+          }));
           batch.set(ref, {
             'equipment_name': unit['equipment_name'],
+            'type_name':      baseNameOf(unit['equipment_name'] ?? ''),
             'category':       data['category'],
             'location':       data['location'] ?? '',
             'qr_code':        unit['qr_code'],
@@ -717,9 +728,11 @@ class ApiService {
           });
           part.add({...unit, 'equipment_id': ref.id});
         }
+        if (keepList) _addTypeWrite(batch, mergeTypeDeltas(deltas));
         await batch.commit();
         saved.addAll(part);
       }
+      forgetItemTypes();
       return {'success': true, 'units': saved, 'status': status};
     } catch (e) {
       return {
@@ -739,6 +752,11 @@ class ApiService {
       // same physical unit; the QR return then found two active loans and
       // refused to complete either, stranding both (QA 2026-09-19, M5).
       final status = data['status'] as String?;
+      var endReservation = false;
+      final eqRef = _db.collection('equipment').doc(equipmentId);
+      // The unit as it is now: for the reservation check below and for the
+      // type list, which follows a new name, status, category or program.
+      final cur = (await eqRef.get()).data();
       if (status != null && status != 'Borrowed') {
         // Single-field query (no composite index needed); filter in Dart.
         final snap = await _db
@@ -758,15 +776,51 @@ class ApiService {
                 'the Dashboard before changing its status.',
           };
         }
+        // A unit reserved for a request that is still Pending keeps its
+        // reservation until staff decide the request or the student cancels
+        // it (2026-10-06). A reservation whose request is already over (an
+        // older app version decided it) just ends here.
+        if (cur?['status'] == 'Reserved' && status != 'Reserved') {
+          final holder = snap.docs.where((d) =>
+              d.id == '${cur?['reserved_tx']}' && d.data()['status'] == 'Pending');
+          if (holder.isNotEmpty) {
+            final who = '${holder.first.data()['borrower_name'] ?? ''}'.trim();
+            return {
+              'success': false,
+              'reserved': true,
+              'message': 'This item is reserved for '
+                  '${who.isEmpty ? 'a pending request' : "$who's pending request"}. '
+                  'Approve or reject that request in Requests first.',
+            };
+          }
+          endReservation = true;
+        }
       }
       // Screens hand over a DateTime (or null to clear it); Firestore stores
       // a Timestamp.
       final fields = Map<String, dynamic>.from(data);
+      if (endReservation) {
+        fields['reserved_tx'] = FieldValue.delete();
+        fields['reserved_by'] = FieldValue.delete();
+      }
       final acquired = fields['date_acquired'];
       if (acquired is DateTime) {
         fields['date_acquired'] = Timestamp.fromDate(acquired);
       }
-      await _db.collection('equipment').doc(equipmentId).update(fields);
+      final batch = _db.batch();
+      if (cur != null) {
+        // The unit as it will be, for the type list (1.0.19).
+        final after = {
+          ...cur,
+          for (final k in ['equipment_name', 'status', 'category', 'location', 'courses'])
+            if (data.containsKey(k)) k: data[k],
+        };
+        fields['type_name'] = baseNameOf('${after['equipment_name'] ?? ''}');
+        if (await _keepingTypeList()) _addTypeWrite(batch, typeDelta(cur, after));
+      }
+      batch.update(eqRef, fields);
+      await batch.commit();
+      forgetItemTypes();
       return {'success': true};
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
@@ -791,7 +845,13 @@ class ApiService {
           'message': 'Cannot delete: this equipment has a pending or active loan.'
         };
       }
-      await _db.collection('equipment').doc(equipmentId).delete();
+      // The unit leaves the type list in the same batch (1.0.19).
+      final eqRef = _db.collection('equipment').doc(equipmentId);
+      final cur = (await eqRef.get()).data();
+      final batch = _db.batch()..delete(eqRef);
+      if (cur != null && await _keepingTypeList()) _addTypeWrite(batch, typeDelta(cur, null));
+      await batch.commit();
+      forgetItemTypes();
       // Best-effort cleanup of the full-size photo; ignore if there is none.
       try {
         await _db.collection('equipment_photos').doc(equipmentId).delete();
@@ -915,45 +975,117 @@ class ApiService {
   static String requestKey(dynamic t) => '${t['student_id']}|${t['borrow_date']}';
 
   // [txns] grouped into requests, in order of first appearance (the lists
-  // arrive newest first).
-  static List<List<dynamic>> groupRequests(List<dynamic> txns) {
+  // arrive newest first). [byStatus] also splits a request by status: a
+  // request can end partly returned and partly rejected (units that ran out
+  // before approval), and a card for both at once took its label from one
+  // record, so rejected items read "Returned. Thank you!" (QA 2026-10-06).
+  // [byPickup] also splits approved units still waiting at the lab from those
+  // handed over (2026-10-06): a card is then "Ready for pick-up" or "On loan",
+  // never both.
+  static List<List<dynamic>> groupRequests(List<dynamic> txns,
+      {bool byStatus = false, bool byPickup = false}) {
     final groups = <String, List<dynamic>>{};
     for (final t in txns) {
-      groups.putIfAbsent(requestKey(t), () => []).add(t);
+      var key = byStatus ? '${requestKey(t)}|${t['status']}' : requestKey(t);
+      if (byPickup && awaitingPickup(t)) key = '$key|ready';
+      groups.putIfAbsent(key, () => []).add(t);
     }
     return groups.values.toList();
   }
 
   // "Beaker 1000 mL × 2, Flask 500 mL" for a request's records (or units).
+  // Alphabetical, so one request reads the same on every screen (the order
+  // used to follow the records, which differs from list to list).
   static String requestSummary(List<dynamic> records) {
     final counts = <String, int>{};
     for (final t in records) {
       final base = baseNameOf('${t['equipment_name'] ?? 'Equipment'}');
       counts[base] = (counts[base] ?? 0) + 1;
     }
-    return counts.entries
-        .map((e) => e.value > 1 ? '${e.key} × ${e.value}' : e.key)
+    final names = counts.keys.toList()..sort();
+    return names
+        .map((n) => counts[n]! > 1 ? '$n × ${counts[n]}' : n)
         .join(', ');
   }
 
-  // The item types a student can borrow right now, for the borrow form's
-  // picker: every Available unit, grouped by type, with how many are free.
-  // One read per available unit. At the lab's size (90 units on 2026-10-05)
-  // that is simpler than paging a grouped list; if the inventory grows into
-  // the thousands, keep a per-type count instead.
+  // ── Reservations (2026-10-06) ──
+  // Sending a request marks each of its units Reserved, naming the request
+  // (reserved_tx) and the student (reserved_by); deciding or cancelling the
+  // request ends the reservation.
+
+  // [equipment] is held for the request [txId].
+  static bool isReservedFor(Map<String, dynamic>? equipment, String txId) =>
+      equipment != null &&
+      equipment['status'] == 'Reserved' &&
+      '${equipment['reserved_tx'] ?? ''}' == txId;
+
+  // The update that makes a reserved unit free again.
+  static Map<String, dynamic> get unreserved => {
+        'status': 'Available',
+        'reserved_tx': FieldValue.delete(),
+        'reserved_by': FieldValue.delete(),
+      };
+
+  // A student cancels their own request while it is still Pending: every
+  // record becomes Cancelled and every unit it reserved is free again, in one
+  // batch. The rules allow a student exactly this.
+  static Future<Map<String, dynamic>> cancelRequest(List<dynamic> records) async {
+    try {
+      final batch = _db.batch();
+      var count = 0;
+      for (final t in records) {
+        if (t['status'] != 'Pending') continue;
+        final id = '${t['transaction_id']}';
+        batch.update(_db.collection('borrow_transactions').doc(id), {
+          'status': 'Cancelled',
+          'cancelled_at': FieldValue.serverTimestamp(),
+        });
+        final eqRef = _db.collection('equipment').doc('${t['equipment_id']}');
+        final eq = await eqRef.get();
+        if (isReservedFor(eq.data(), id)) batch.update(eqRef, unreserved);
+        count++;
+      }
+      if (count == 0) {
+        return {'success': false, 'message': 'This request is no longer waiting.'};
+      }
+      await batch.commit();
+      return {'success': true, 'message': 'Request cancelled.'};
+    } on FirebaseException catch (e) {
+      // Staff decided it a moment ago: the rules only allow cancelling Pending.
+      if (e.code == 'permission-denied') {
+        return {
+          'success': false,
+          'message': 'Staff have just acted on this request, so it can no '
+              'longer be cancelled. Check My Loans.',
+        };
+      }
+      return {'success': false, 'message': friendlyError(e)};
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // The item types a student can borrow right now: every Available unit,
+  // grouped by type, with how many are free. One read per available unit,
+  // which was fine at 90 units (2026-10-05) and is not at 1,067 (2026-10-15):
+  // since 1.0.19 the screens use the item-type list below and come here only
+  // until that list has been built.
   static Future<List<Map<String, dynamic>>> getAvailableTypes() async {
     final snap = await _db
         .collection('equipment')
         .where('status', isEqualTo: 'Available')
         .get();
     final types = <String, Map<String, dynamic>>{};
+    final unitsOf = <String, List<Map<String, dynamic>>>{};
     for (final d in snap.docs) {
       final data = d.data();
       final base = baseNameOf('${data['equipment_name'] ?? ''}');
       if (base.isEmpty) continue;
+      unitsOf.putIfAbsent(base, () => []).add(data);
       final t = types.putIfAbsent(base, () => {
             'name':     base,
             'category': data['category'] ?? '',
+            'location': data['location'] ?? '',
             'count':    0,
           });
       t['count'] = (t['count'] as int) + 1;
@@ -962,9 +1094,462 @@ class ApiService {
         t['photo_thumb'] = data['photo_thumb'];
       }
     }
+    for (final e in types.entries) {
+      e.value['courses'] = typeCourses(unitsOf[e.key]!);
+    }
     return types.values.toList()
       ..sort((a, b) =>
           '${a['name']}'.toLowerCase().compareTo('${b['name']}'.toLowerCase()));
+  }
+
+  // ── Item types (1.0.19, 2026-10-15) ──────────────────────────────────────
+  // With 1,067 units the borrow form read every Available unit (~945) each
+  // time its item list opened, and a search read the whole collection, so the
+  // free plan's 50,000 reads a day would have covered about 25 requests. Now
+  // one record, equipment_types/all, lists every item TYPE with how many units
+  // it has and how many are out of service. Students read that one record for
+  // the catalog and the item list, and count one type's Available units (one
+  // read) only when they pick it. Only staff write the record, in the same
+  // batch as the unit change it follows, so no student action touches it, and
+  // availability is never stored, only counted.
+  //   types.<type name> = {category, location, courses, units, out}
+  //   complete          = true once rebuildItemTypes has written it; until
+  //                       then the screens read units the old way.
+  // Every unit also carries type_name (its base name), so "the units of a
+  // type" is an equality query.
+
+  static DocumentReference<Map<String, dynamic>> get _typesRef =>
+      _db.collection('equipment_types').doc('all');
+
+  // Under Repair and For Disposal units cannot be lent; every other status
+  // (Available, Reserved, Borrowed) is in service.
+  static bool isOutOfService(String? status) =>
+      status == 'Under Repair' || status == 'For Disposal';
+
+  static List<String> _strings(dynamic list) =>
+      (list as List?)?.map((c) => '$c').toList() ?? <String>[];
+
+  // A type's programs: every program its units name, in the usual order, or
+  // none (open to every program, as for a single unit) when any unit names
+  // none. Pure, so it is unit-tested.
+  static List<String> typeCourses(Iterable<Map<String, dynamic>> units) {
+    final all = <String>{};
+    for (final u in units) {
+      final cs = _strings(u['courses']);
+      if (cs.isEmpty) return <String>[];
+      all.addAll(cs);
+    }
+    return [
+      ...kCourses.where(all.contains),
+      ...all.where((c) => !kCourses.contains(c)),
+    ];
+  }
+
+  // The type list for [units], as rebuildItemTypes stores it. A type's
+  // category and location are the ones most of its units have. Pure, so it
+  // is unit-tested.
+  static Map<String, Map<String, dynamic>> buildTypeIndex(
+      Iterable<Map<String, dynamic>> units) {
+    final groups = <String, List<Map<String, dynamic>>>{};
+    for (final u in units) {
+      final type = baseNameOf('${u['equipment_name'] ?? ''}');
+      if (type.isEmpty) continue;
+      groups.putIfAbsent(type, () => []).add(u);
+    }
+    String mostCommon(List<Map<String, dynamic>> us, String field) {
+      final counts = <String, int>{};
+      for (final u in us) {
+        final v = '${u[field] ?? ''}'.trim();
+        if (v.isNotEmpty) counts[v] = (counts[v] ?? 0) + 1;
+      }
+      if (counts.isEmpty) return '';
+      final keys = counts.keys.toList()
+        ..sort((a, b) {
+          final byCount = counts[b]!.compareTo(counts[a]!);
+          return byCount != 0 ? byCount : a.compareTo(b);
+        });
+      return keys.first;
+    }
+
+    return {
+      for (final e in groups.entries)
+        e.key: {
+          'category': mostCommon(e.value, 'category'),
+          'location': mostCommon(e.value, 'location'),
+          'courses':  typeCourses(e.value),
+          'units':    e.value.length,
+          'out': e.value.where((u) => isOutOfService('${u['status']}')).length,
+        },
+    };
+  }
+
+  // The stored list as the screens use it: one map per type, by name, with
+  // in_service = units that can be lent at all. Types with no units left are
+  // dropped (a delete leaves a zero until the next rebuild). Pure.
+  static List<Map<String, dynamic>> typeListFrom(Map<String, dynamic>? types) {
+    final list = <Map<String, dynamic>>[];
+    (types ?? const <String, dynamic>{}).forEach((name, v) {
+      if (v is! Map) return;
+      final units = (v['units'] as num?)?.toInt() ?? 0;
+      if (units <= 0) return;
+      var out = (v['out'] as num?)?.toInt() ?? 0;
+      if (out < 0) out = 0;
+      if (out > units) out = units;
+      list.add({
+        'name':       name,
+        'category':   '${v['category'] ?? ''}',
+        'location':   '${v['location'] ?? ''}',
+        'courses':    _strings(v['courses']),
+        'units':      units,
+        'out':        out,
+        'in_service': units - out,
+      });
+    });
+    list.sort((a, b) =>
+        '${a['name']}'.toLowerCase().compareTo('${b['name']}'.toLowerCase()));
+    return list;
+  }
+
+  // How one unit's change moves the type list. [before] and [after] are the
+  // unit as it was and as it will be (equipment_name, status, category,
+  // location, courses); null for a new or a deleted unit. Returns, per type,
+  // the change in `units` and `out`, and the category, location and programs
+  // of the type the unit ends up in where they are new or changed. Pure, so
+  // it is unit-tested.
+  static Map<String, Map<String, dynamic>> typeDelta(
+      Map<String, dynamic>? before, Map<String, dynamic>? after) {
+    final delta = <String, Map<String, dynamic>>{};
+    String typeOf(Map<String, dynamic> u) => baseNameOf('${u['equipment_name'] ?? ''}');
+    void count(Map<String, dynamic> unit, int sign) {
+      final type = typeOf(unit);
+      if (type.isEmpty) return;
+      final d = delta.putIfAbsent(type, () => {'units': 0, 'out': 0});
+      d['units'] = (d['units'] as int) + sign;
+      if (isOutOfService('${unit['status']}')) d['out'] = (d['out'] as int) + sign;
+    }
+
+    if (before != null) count(before, -1);
+    if (after != null) {
+      count(after, 1);
+      final type = typeOf(after);
+      if (type.isNotEmpty) {
+        final d = delta[type]!;
+        final moved = before == null || typeOf(before) != type;
+        for (final field in ['category', 'location']) {
+          if (!after.containsKey(field)) continue;
+          final v = '${after[field] ?? ''}'.trim();
+          if (moved || v != '${before[field] ?? ''}'.trim()) d[field] = v;
+        }
+        if (after.containsKey('courses')) {
+          final v = _strings(after['courses']);
+          if (moved || v.join('|') != _strings(before['courses']).join('|')) {
+            d['courses'] = v;
+          }
+        }
+      }
+    }
+    return delta;
+  }
+
+  // Several typeDelta results as one: counts add up, the last attributes win.
+  static Map<String, Map<String, dynamic>> mergeTypeDeltas(
+      Iterable<Map<String, Map<String, dynamic>>> deltas) {
+    final merged = <String, Map<String, dynamic>>{};
+    for (final d in deltas) {
+      d.forEach((type, change) {
+        final m = merged.putIfAbsent(type, () => {'units': 0, 'out': 0});
+        change.forEach((k, v) {
+          if (k == 'units' || k == 'out') {
+            m[k] = (m[k] as int) + (v as int);
+          } else {
+            m[k] = v;
+          }
+        });
+      });
+    }
+    return merged;
+  }
+
+  // [delta] as a merge write on the type list, or null when it changes
+  // nothing. Counts are increments, so two staff changing units of one type
+  // at the same moment both count. Map keys are literal under set(merge), so
+  // a type name with a dot in it ("L.A. Abrasion Machine") is safe.
+  static Map<String, dynamic>? _typeWrite(Map<String, Map<String, dynamic>> delta) {
+    final types = <String, dynamic>{};
+    delta.forEach((type, change) {
+      final m = <String, dynamic>{};
+      change.forEach((k, v) {
+        if (k == 'units' || k == 'out') {
+          if (v != 0) m[k] = FieldValue.increment(v as int);
+        } else {
+          m[k] = v;
+        }
+      });
+      if (m.isNotEmpty) types[type] = m;
+    });
+    if (types.isEmpty) return null;
+    return {'types': types, 'updated_at': FieldValue.serverTimestamp()};
+  }
+
+  // The list is kept current only once it exists and can be read: before the
+  // first rebuild there is nothing to keep, and rules from before 1.0.19
+  // would refuse the write, and with it the whole batch (a registration or
+  // a return would fail).
+  static Future<bool> _keepingTypeList() async => await getItemTypes() != null;
+
+  static void _addTypeWrite(WriteBatch batch, Map<String, Map<String, dynamic>> delta) {
+    final w = _typeWrite(delta);
+    if (w != null) batch.set(_typesRef, w, SetOptions(merge: true));
+  }
+
+  // The list is cached: it changes only when staff register, edit or delete
+  // equipment, and availability is always counted live.
+  static List<Map<String, dynamic>>? _typeCache;
+  static DateTime? _typeCacheAt;
+  static const _typeCacheTtl = Duration(minutes: 10);
+
+  static void forgetItemTypes() {
+    _typeCache = null;
+    _typeCacheAt = null;
+  }
+
+  // The item-type list (one read, then cached), or null when it has not been
+  // built yet or cannot be read (rules from before 1.0.19 refuse it): the
+  // screens then read units the old way instead of failing.
+  static Future<List<Map<String, dynamic>>?> getItemTypes({bool refresh = false}) async {
+    final at = _typeCacheAt;
+    if (!refresh &&
+        _typeCache != null &&
+        at != null &&
+        DateTime.now().difference(at) < _typeCacheTtl) {
+      return _typeCache;
+    }
+    Map<String, dynamic>? data;
+    try {
+      data = (await _typesRef.get()).data();
+    } catch (_) {
+      forgetItemTypes();
+      return null;
+    }
+    if (data == null || data['complete'] != true) {
+      forgetItemTypes();
+      return null;
+    }
+    _typeCache = typeListFrom(data['types'] as Map<String, dynamic>?);
+    _typeCacheAt = DateTime.now();
+    return _typeCache;
+  }
+
+  // What a student can choose from: the types with at least one unit in
+  // service. `counted` is true for the fallback list (before the type list is
+  // built), whose `available` is the number free right now; from the type list
+  // each type has `in_service`, and availability is counted when picked.
+  static Future<({List<Map<String, dynamic>> types, bool counted})> getBorrowableTypes(
+      {bool refresh = false}) async {
+    final listed = await getItemTypes(refresh: refresh);
+    if (listed != null) {
+      return (
+        types: [for (final t in listed) if ((t['in_service'] as int) > 0) t],
+        counted: false,
+      );
+    }
+    final legacy = await getAvailableTypes();
+    return (
+      types: [
+        for (final t in legacy)
+          {...t, 'available': t['count'], 'in_service': t['count'], 'units': t['count']},
+      ],
+      counted: true,
+    );
+  }
+
+  // How many units of [type] are free right now: one count, billed as one
+  // read. Two equality filters need no composite index; should the count ever
+  // be refused, the type's units are read instead.
+  static Future<int> availableNow(String type) async {
+    if (await getItemTypes() == null) {
+      final legacy = await getAvailableTypes();
+      final match = legacy.where((t) => t['name'] == type);
+      return match.isEmpty ? 0 : (match.first['count'] as int? ?? 0);
+    }
+    final units = _db.collection('equipment').where('type_name', isEqualTo: type);
+    try {
+      return (await units.where('status', isEqualTo: 'Available').count().get()).count ?? 0;
+    } catch (_) {
+      final snap = await units.get();
+      return snap.docs.where((d) => d.data()['status'] == 'Available').length;
+    }
+  }
+
+  // Every unit named [type] or "[type] #n", found by name range: how units
+  // were found before they carried type_name (one read per unit of the name).
+  static Future<List<Map<String, dynamic>>> _unitsNamed(String type) async {
+    final snap = await _db
+        .collection('equipment')
+        .where('equipment_name', isGreaterThanOrEqualTo: type)
+        .where('equipment_name', isLessThan: '$type')
+        .get();
+    return [
+      for (final d in snap.docs)
+        if (baseNameOf('${d.data()['equipment_name'] ?? ''}') == type)
+          {...d.data(), 'equipment_id': d.id},
+    ];
+  }
+
+  // One unit standing for [type] on the student's item page: an Available one
+  // when there is one.
+  static Future<Map<String, dynamic>?> sampleUnitOf(String type) async {
+    final col = _db.collection('equipment');
+    var snap = await col
+        .where('type_name', isEqualTo: type)
+        .where('status', isEqualTo: 'Available')
+        .limit(1)
+        .get();
+    if (snap.docs.isEmpty) {
+      snap = await col.where('type_name', isEqualTo: type).limit(1).get();
+    }
+    if (snap.docs.isNotEmpty) {
+      return {...snap.docs.first.data(), 'equipment_id': snap.docs.first.id};
+    }
+    // Units from before the first rebuild.
+    final units = await _unitsNamed(type);
+    if (units.isEmpty) return null;
+    return units.firstWhere((u) => u['status'] == 'Available', orElse: () => units.first);
+  }
+
+  // Free units of [type] to reserve from, reading only what a request needs:
+  // a few more Available units than asked (one may go meanwhile), plus the
+  // unit the student was looking at. While the type list is not built yet,
+  // units have no type_name, so the name-range read runs instead.
+  static Future<List<Map<String, dynamic>>> _freeUnitsOf(
+      String type, int quantity, {String preferId = ''}) async {
+    final snap = await _db
+        .collection('equipment')
+        .where('type_name', isEqualTo: type)
+        .where('status', isEqualTo: 'Available')
+        .limit(quantity + 10)
+        .get();
+    final units = [for (final d in snap.docs) {...d.data(), 'equipment_id': d.id}];
+    if (preferId.isNotEmpty && !units.any((u) => '${u['equipment_id']}' == preferId)) {
+      final p = await getEquipmentById(preferId);
+      if (p != null &&
+          p['status'] == 'Available' &&
+          baseNameOf('${p['equipment_name'] ?? ''}') == type) {
+        units.add(p);
+      }
+    }
+    if (units.length >= quantity || await getItemTypes() != null) return units;
+    return _unitsNamed(type);
+  }
+
+  // Every unit of [types] (staff Inventory and QR labels), by name. `in`
+  // takes up to 30 values per query.
+  static Future<List<Map<String, dynamic>>> unitsOfTypes(List<String> types) async {
+    final units = <Map<String, dynamic>>[];
+    for (var i = 0; i < types.length; i += 30) {
+      final chunk = types.sublist(i, i + 30 > types.length ? types.length : i + 30);
+      final snap = await _db.collection('equipment').where('type_name', whereIn: chunk).get();
+      units.addAll([for (final d in snap.docs) {...d.data(), 'equipment_id': d.id}]);
+    }
+    units.sort((a, b) => '${a['equipment_name'] ?? ''}'
+        .toLowerCase()
+        .compareTo('${b['equipment_name'] ?? ''}'.toLowerCase()));
+    return units;
+  }
+
+  // A search box entry that is (the start of) a QR code: "MEA-86898",
+  // "too-869071", or just the digits ("869071"). Pure, so it is unit-tested.
+  static bool looksLikeQrCode(String q) =>
+      RegExp(r'^([a-z]{3}-\d*|\d{3,6})$', caseSensitive: false).hasMatch(q.trim());
+
+  // The units whose QR code starts with [q] ("MEA-8689"), or whose six digits
+  // start with it ("8689", any category). Reads only the matches.
+  static Future<List<Map<String, dynamic>>> unitsByQrCode(String q) async {
+    final code = q.trim().toUpperCase();
+    final prefixes = code.contains('-')
+        ? [code]
+        : [for (final c in kCategories) '${_qrPrefix(c)}-$code'];
+    final units = <Map<String, dynamic>>[];
+    for (final p in prefixes.toSet()) {
+      final snap = await _db
+          .collection('equipment')
+          .where('qr_code', isGreaterThanOrEqualTo: p)
+          .where('qr_code', isLessThanOrEqualTo: '$p')
+          .limit(200)
+          .get();
+      units.addAll([for (final d in snap.docs) {...d.data(), 'equipment_id': d.id}]);
+    }
+    units.sort((a, b) => '${a['equipment_name'] ?? ''}'
+        .toLowerCase()
+        .compareTo('${b['equipment_name'] ?? ''}'.toLowerCase()));
+    return units;
+  }
+
+  // The type names a staff search means: names containing it, and the type a
+  // unit name belongs to ("Digital Multimeter #03" → Digital Multimeter).
+  // Pure, so it is unit-tested.
+  static List<String> typesMatching(Iterable<String> types, String query) {
+    final q = query.trim().toLowerCase();
+    final base = baseNameOf(q);
+    return [
+      for (final t in types)
+        if (q.isEmpty ||
+            t.toLowerCase().contains(q) ||
+            (base != q && t.toLowerCase() == base))
+          t,
+    ];
+  }
+
+  // Rebuilds the type list from every unit (one read per unit, so staff run
+  // it when setting the list up, after an import, or if it ever looks wrong)
+  // and gives each unit the right type_name. The first run is what switches
+  // the screens over from reading units.
+  static Future<Map<String, dynamic>> rebuildItemTypes(
+      {void Function(int done, int total)? onProgress}) async {
+    try {
+      final snap = await _db.collection('equipment').get();
+      final units = [for (final d in snap.docs) {...d.data(), 'equipment_id': d.id}];
+      final stale = [
+        for (final u in units)
+          if ('${u['type_name'] ?? ''}' != baseNameOf('${u['equipment_name'] ?? ''}')) u,
+      ];
+      // Eight updates to a batch (the rules read the staff record for each
+      // write, and a batch may make 20 such reads), four batches at a time.
+      final batches = <WriteBatch>[];
+      for (var i = 0; i < stale.length; i += 8) {
+        final batch = _db.batch();
+        for (final u in stale.skip(i).take(8)) {
+          batch.update(_db.collection('equipment').doc('${u['equipment_id']}'),
+              {'type_name': baseNameOf('${u['equipment_name'] ?? ''}')});
+        }
+        batches.add(batch);
+      }
+      var done = 0;
+      for (var i = 0; i < batches.length; i += 4) {
+        final group = batches.skip(i).take(4).toList();
+        await Future.wait(group.map((b) => b.commit()));
+        done = (i + group.length) * 8 > stale.length ? stale.length : (i + group.length) * 8;
+        onProgress?.call(done, stale.length);
+      }
+      final types = buildTypeIndex(units);
+      await _typesRef.set({
+        'complete':   true,
+        'types':      types,
+        'unit_count': units.length,
+        'rebuilt_at': FieldValue.serverTimestamp(),
+        'rebuilt_by': Session.name,
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+      forgetItemTypes();
+      return {
+        'success':    true,
+        'types':      types.length,
+        'units':      units.length,
+        'backfilled': stale.length,
+      };
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
   }
 
   // A borrow request: one or more item types, each with a quantity. Each unit
@@ -1004,13 +1589,18 @@ class ApiService {
         };
       }
 
-      // The student's own records, read once for both the overdue gate and the
-      // duplicate check below (these used to be two identical queries).
+      // The student's open records (Pending and Approved), read once for both
+      // the overdue gate and the duplicate check below (these used to be two
+      // identical queries). Both checks look only at open records, so reading
+      // the whole history cost one read per past loan on every request (59 for
+      // the demo student, 2026-10-15); a student usually has none or a few open.
+      // Equality + `in` needs no composite index (checked live).
       final mine = sid.isEmpty
           ? <Map<String, dynamic>>[]
           : (await _db
                   .collection('borrow_transactions')
                   .where('student_id', isEqualTo: sid)
+                  .where('status', whereIn: kOpenRequestStatuses)
                   .get())
               .docs
               .map((d) => d.data())
@@ -1059,9 +1649,9 @@ class ApiService {
       // low #3; per type since 2026-10-05) ──
       // Tapping Submit twice, or coming back to the form later, used to file a
       // second Pending request for the same thing, and staff saw the same
-      // student queued twice. A student cannot withdraw a request themselves —
-      // the rules only let staff update a transaction — so the duplicate had to
-      // be rejected by hand.
+      // student queued twice, and had to reject the duplicate by hand. (A
+      // student can cancel their own pending request since 2026-10-06; to
+      // change one, they cancel it and send a new one.)
       final pendingTypes = mine
           .where((t) => t['status'] == 'Pending')
           .map((t) => baseNameOf('${t['equipment_name'] ?? ''}'))
@@ -1078,19 +1668,12 @@ class ApiService {
       }
 
       // Reserve the units: for each type, its Available units, the one the
-      // student was looking at first, then by unit number (pickUnits).
+      // student was looking at first, then by unit number (pickUnits). Only a
+      // few more free units than asked are read (1.0.19), not every unit of
+      // the type: there are 197 sieves.
       final picked = <Map<String, dynamic>>[];
       for (final l in wanted) {
-        final snap = await _db
-            .collection('equipment')
-            .where('equipment_name', isGreaterThanOrEqualTo: l.name)
-            .where('equipment_name', isLessThan: '${l.name}')
-            .get();
-        final units = [
-          for (final d in snap.docs)
-            if (baseNameOf('${d.data()['equipment_name'] ?? ''}') == l.name)
-              {...d.data(), 'equipment_id': d.id},
-        ];
+        final units = await _freeUnitsOf(l.name, l.quantity, preferId: l.preferId);
         final chosen = pickUnits(units, l.quantity, preferId: l.preferId);
         if (chosen.length < l.quantity) {
           return {
@@ -1116,18 +1699,29 @@ class ApiService {
       // no longer reach anything they could not reach already.
 
       // Honour the student's requested return time, enforcing the same-day
-      // 5:00 PM laboratory policy as the latest possible deadline.
+      // 10:00 PM laboratory policy as the latest possible deadline.
       final now = DateTime.now();
       final dueDate =
           computeDueDate(now, DateTime.tryParse('${data['due_date'] ?? ''}'));
 
       // One batch: every record gets the same borrow_date, which is what ties
-      // them together as one request. At most kMaxUnitsPerRequest writes, each
-      // checked by the rules with two document reads (the student's profile
-      // and the unit), inside a batch's limit of 20.
+      // them together as one request.
+      // The same batch reserves each unit (2026-10-06): it turns Reserved, so
+      // no other student can ask for it while staff decide, and approval
+      // rarely has to swap units any more. The rules let a student make
+      // exactly this change, and only for the request they are sending.
+      // The rules read the student's profile once and two documents per unit
+      // (the unit, and the record reserving it), so kMaxUnitsPerRequest (8)
+      // stays inside the 20 reads a batch is allowed: 1 + 2 × 8 = 17.
       final batch = _db.batch();
       for (final u in picked) {
-        batch.set(_db.collection('borrow_transactions').doc(), {
+        final txRef = _db.collection('borrow_transactions').doc();
+        batch.update(_db.collection('equipment').doc('${u['equipment_id']}'), {
+          'status':      'Reserved',
+          'reserved_tx': txRef.id,
+          'reserved_by': sid,
+        });
+        batch.set(txRef, {
           'student_id':     sid,
           'equipment_id':   u['equipment_id'],
           'equipment_name': u['equipment_name'],
@@ -1145,6 +1739,8 @@ class ApiService {
           'borrower_name':  stuData?['name'] ?? data['borrower_name'] ?? '',
           'student_number': stuData?['student_number'] ?? data['student_number'] ?? '',
           'subject':        data['subject'] ?? '',
+          // Where the items will be used (1.0.20), for tracing the borrower.
+          'use_location':   data['use_location'] ?? '',
           // One unit per record; the request's size is how many records
           // share its borrow_date.
           'quantity':       1,
@@ -1178,23 +1774,23 @@ class ApiService {
     }
   }
 
-  // Same-day 5:00 PM due-date policy: a requested time at or before 17:00 is
-  // honoured (on today's date); anything later — or no request — clamps to
-  // 17:00. Public and pure so the policy is unit-testable (see test/).
+  // Same-day 10:00 PM due-date policy (kReturnByHour; 5:00 PM until 1.0.20):
+  // a requested time at or before 22:00 is honoured (on today's date);
+  // anything later — or no request — clamps to 22:00. Public and pure so the
+  // policy is unit-testable (see test/).
   //
   // A requested time that has already passed is not a deadline at all, so it
-  // falls back to the 17:00 default instead of being stored as-is. The form
+  // falls back to the 22:00 default instead of being stored as-is. The form
   // refuses one up front with a clear message; this is the backstop that keeps
   // a loan from being overdue the instant it is approved (QA 2026-09-19, M3).
   static DateTime computeDueDate(DateTime now, DateTime? requested) {
-    if (requested != null &&
-        !(requested.hour > 17 ||
-            (requested.hour == 17 && requested.minute > 0))) {
+    final latest = DateTime(now.year, now.month, now.day, kReturnByHour, 0, 0);
+    if (requested != null) {
       final sameDay = DateTime(
           now.year, now.month, now.day, requested.hour, requested.minute, 0);
-      if (sameDay.isAfter(now)) return sameDay;
+      if (sameDay.isAfter(now) && !sameDay.isAfter(latest)) return sameDay;
     }
-    return DateTime(now.year, now.month, now.day, 17, 0, 0);
+    return latest;
   }
 
   // Equipment status for a given condition. Used both when an item is returned
@@ -1219,6 +1815,7 @@ class ApiService {
       dynamic transactionId, String condition) async {
     try {
       final txRef = _db.collection('borrow_transactions').doc('$transactionId');
+      final keepList = await _keepingTypeList();
       return await _db.runTransaction((tx) async {
         final txDoc = await tx.get(txRef);
         if (!txDoc.exists) {
@@ -1238,6 +1835,16 @@ class ApiService {
                 'active loan. Refresh to see the latest.'
           };
         }
+        // Still on the lab's counter: there is nothing to take back.
+        if (data['awaiting_pickup'] == true) {
+          return {
+            'success': false,
+            'awaiting_pickup': true,
+            'message': '${data['equipment_name'] ?? 'This item'} has not been '
+                'handed over yet. Hand it over, or mark the request Not '
+                'picked up.',
+          };
+        }
         final equipId = data['equipment_id'] as String;
         tx.update(txRef, {
           'status':             'Returned',
@@ -1247,8 +1854,17 @@ class ApiService {
           'returned_by':        Session.staffId,
           'returned_by_name':   Session.name,
         });
-        tx.update(_db.collection('equipment').doc(equipId),
-            {'status': equipmentStatusForCondition(condition)});
+        final newStatus = equipmentStatusForCondition(condition);
+        tx.update(_db.collection('equipment').doc(equipId), {'status': newStatus});
+        // A damaged unit leaves service: one more "out" for its type
+        // (1.0.19). A unit on loan is in service, so a good return changes
+        // nothing there.
+        final type = baseNameOf('${data['equipment_name'] ?? ''}');
+        if (keepList && isOutOfService(newStatus) && type.isNotEmpty) {
+          final w = _typeWrite({type: {'units': 0, 'out': 1}});
+          if (w != null) tx.set(_typesRef, w, SetOptions(merge: true));
+          forgetItemTypes();
+        }
         return {'success': true, 'message': 'Equipment returned successfully.'};
       });
     } catch (e) {
@@ -1393,16 +2009,16 @@ class ApiService {
     final held     = await heldF;
 
     final now = DateTime.now();
-    final overdue = approved.where((e) {
-      final due = DateTime.tryParse('${e['due_date']}'.replaceAll(' ', 'T'));
-      return due != null && due.isBefore(now);
-    }).length;
+    final overdue = approved.where((e) => isOverdue(e, now: now)).length;
 
     return (
       stats: {
         // Requests, not records: one request can hold several units.
         'pending_requests':    groupRequests(pending).length,
-        'active_loans':        approved.length,
+        // Units in students' hands; approved units still at the lab are not
+        // out yet (2026-10-06).
+        'active_loans':        approved.where(isOut).length,
+        'ready_for_pickup':    groupRequests(approved.where(awaitingPickup).toList()).length,
         'overdue_loans':       overdue,
         'total_equipment':     equip.total,
         'available_equipment': equip.available,
@@ -1415,6 +2031,16 @@ class ApiService {
     );
   }
 
+  // Every record still Pending or Approved, whenever it was sent: the
+  // "right now" figures on Reports (2026-10-06). Naturally small.
+  static Future<List<dynamic>> getOpenRequests() async {
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('status', whereIn: ['Pending', 'Approved'])
+        .get();
+    return _mapTransactionDocs(snap.docs);
+  }
+
   // Transactions from a cutoff date onward. borrow_transactions is the one
   // collection that grows without bound — equipment and students plateau, but
   // every borrow adds a row forever — so the reports screen scopes itself to a
@@ -1424,6 +2050,18 @@ class ApiService {
     final snap = await _db
         .collection('borrow_transactions')
         .where('borrow_date', isGreaterThanOrEqualTo: Timestamp.fromDate(cutoff))
+        .get();
+    return _mapTransactionDocs(snap.docs);
+  }
+
+  // Transactions sent from [start] up to, not including, [end]: the Full
+  // Report for dates staff chose (2026-10-07). Both bounds are on the one
+  // field, so the automatic index still covers it.
+  static Future<List<dynamic>> getRequestsBetween(DateTime start, DateTime end) async {
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('borrow_date', isGreaterThanOrEqualTo: Timestamp.fromDate(start))
+        .where('borrow_date', isLessThan: Timestamp.fromDate(end))
         .get();
     return _mapTransactionDocs(snap.docs);
   }
@@ -1491,6 +2129,14 @@ class ApiService {
       .snapshots()
       .map((snap) => _mapTransactionDocs(snap.docs)));
 
+  // The records [ids] (one request, at most kMaxUnitsPerRequest), live: the
+  // hand-over checklist ticks each unit off as it is scanned.
+  static Stream<List<dynamic>> recordsStream(List<String> ids) => _untilSignOut(_db
+      .collection('borrow_transactions')
+      .where(FieldPath.documentId, whereIn: ids)
+      .snapshots()
+      .map((snap) => _mapTransactionDocs(snap.docs)));
+
   // The Requests tab's "All" list: everything from the last [days] days, the
   // same window as Reports. A single-field inequality, so Firestore's
   // automatic index covers it.
@@ -1539,13 +2185,15 @@ class ApiService {
 
         final equipId = txData['equipment_id'] as String;
         final eqRef = _db.collection('equipment').doc(equipId);
+        final eqDoc = await tx.get(eqRef);
+        final eqData = eqDoc.exists ? eqDoc.data() as Map<String, dynamic> : null;
+        // This request's own reservation (2026-10-06). Requests sent by older
+        // app versions reserved nothing; their unit is simply Available.
+        final reservedForThis = isReservedFor(eqData, '$transactionId');
 
         if (action == 'approve') {
-          final eqDoc = await tx.get(eqRef);
-          final eqStatus = eqDoc.exists
-              ? (eqDoc.data() as Map<String, dynamic>)['status']
-              : null;
-          if (eqStatus != 'Available') {
+          final eqStatus = eqData?['status'];
+          if (eqStatus != 'Available' && !reservedForThis) {
             return {
               'success': false,
               // approveRequest() takes this as its cue to offer the request
@@ -1562,8 +2210,14 @@ class ApiService {
             'approved_by': Session.staffId,
             'approved_by_name': Session.name,
             'approved_at': FieldValue.serverTimestamp(),
+            // Set aside for the student; the loan starts at hand-over.
+            'awaiting_pickup': true,
           });
-          tx.update(eqRef, {'status': 'Borrowed'});
+          tx.update(eqRef, {
+            'status': 'Borrowed',
+            'reserved_tx': FieldValue.delete(),
+            'reserved_by': FieldValue.delete(),
+          });
           return {'success': true, 'message': 'Request approved.'};
         } else {
           tx.update(txRef, {
@@ -1573,6 +2227,8 @@ class ApiService {
             'rejected_at': FieldValue.serverTimestamp(),
             if (reason.trim().isNotEmpty) 'reject_reason': reason.trim(),
           });
+          // A denied request gives its reserved unit back.
+          if (reservedForThis) tx.update(eqRef, unreserved);
           return {'success': true, 'message': 'Request rejected.'};
         }
       });
@@ -1592,16 +2248,8 @@ class ApiService {
     try {
       final base = baseNameOf('${first['equipment_name'] ?? ''}');
       if (base.isEmpty) return first;
-      final snap = await _db
-          .collection('equipment')
-          .where('equipment_name', isGreaterThanOrEqualTo: base)
-          .where('equipment_name', isLessThan: '$base')
-          .get();
-      final candidates = pickUnits([
-        for (final d in snap.docs)
-          if (baseNameOf('${d.data()['equipment_name'] ?? ''}') == base)
-            {...d.data(), 'equipment_id': d.id},
-      ], snap.docs.length);
+      final free = await _freeUnitsOf(base, 1);
+      final candidates = pickUnits(free, free.length);
       for (final unit in candidates) {
         final res = await _approveAs(txId, unit);
         // Done, or another staff member decided it meanwhile.
@@ -1651,6 +2299,7 @@ class ApiService {
         'approved_by':      Session.staffId,
         'approved_by_name': Session.name,
         'approved_at':      FieldValue.serverTimestamp(),
+        'awaiting_pickup':  true,
       });
       tx.update(eqRef, {'status': 'Borrowed'});
       return {
@@ -1687,6 +2336,228 @@ class ApiService {
               ? firstError
               : '$done of ${txIds.length} done. $firstError',
     };
+  }
+
+  // ── Hand-over, returns and return times (2026-10-06) ──
+
+  // Which record of [records] (one request) the scanned [unit] hands over:
+  // the record for that very unit if it is still waiting, otherwise a waiting
+  // record of the same item type (the unit then swaps in). Null when the unit
+  // is not part of the request. Pure, so it is unit-tested.
+  static Map<String, dynamic>? handOverTarget(
+      List<dynamic> records, Map<String, dynamic> unit) {
+    final waiting = records.where(awaitingPickup).cast<Map<String, dynamic>>();
+    final id = '${unit['equipment_id'] ?? ''}';
+    for (final t in waiting) {
+      if ('${t['equipment_id']}' == id) return t;
+    }
+    final base = baseNameOf('${unit['equipment_name'] ?? ''}');
+    for (final t in waiting) {
+      if (baseNameOf('${t['equipment_name'] ?? ''}') == base) return t;
+    }
+    return null;
+  }
+
+  // Hand over the record [txId] as the unit staff just scanned. That unit
+  // starts the loan. If it is not the unit approval set aside, it must be a
+  // free unit of the same type: it takes the record's place and the one set
+  // aside goes back on the shelf, so the record always names the unit the
+  // student actually holds.
+  static Future<Map<String, dynamic>> handOver(
+      String txId, Map<String, dynamic> unit) async {
+    try {
+      final txRef  = _db.collection('borrow_transactions').doc(txId);
+      final newRef = _db.collection('equipment').doc('${unit['equipment_id']}');
+      return await _db.runTransaction((tx) async {
+        final t = (await tx.get(txRef)).data();
+        if (t == null) {
+          return {'success': false, 'message': 'Transaction not found.'};
+        }
+        if (!awaitingPickup(t)) {
+          return {
+            'success': false,
+            'message': '${t['equipment_name'] ?? 'This item'} is no longer '
+                'waiting to be handed over. Refresh to see the latest.',
+          };
+        }
+        final picked = {
+          'awaiting_pickup':   FieldValue.delete(),
+          'picked_up_at':      FieldValue.serverTimestamp(),
+          'picked_up_by':      Session.staffId,
+          'picked_up_by_name': Session.name,
+        };
+        if (newRef.id == '${t['equipment_id']}') {
+          tx.update(txRef, picked);
+          return {'success': true, 'message': 'Handed over ${t['equipment_name']}.'};
+        }
+
+        final oldRef = _db.collection('equipment').doc('${t['equipment_id']}');
+        final e = (await tx.get(newRef)).data();
+        final old = (await tx.get(oldRef)).data();
+        if (e == null) return {'success': false, 'message': 'Equipment not found.'};
+        final name = '${e['equipment_name'] ?? 'This unit'}';
+        if (baseNameOf(name) != baseNameOf('${t['equipment_name'] ?? ''}')) {
+          return {
+            'success': false,
+            'message': '$name is not a ${baseNameOf('${t['equipment_name'] ?? ''}')}.',
+          };
+        }
+        if (e['status'] != 'Available') {
+          return {
+            'success': false,
+            'message': e['status'] == 'Reserved'
+                ? '$name is reserved for another request. Hand over a different one.'
+                : '$name is ${'${e['status'] ?? 'unavailable'}'.toLowerCase()}, so '
+                    'it cannot be lent. Hand over a different one.',
+          };
+        }
+        tx.update(txRef, {
+          'equipment_id':   newRef.id,
+          'equipment_name': e['equipment_name'],
+          'qr_code':        e['qr_code'],
+          'category':       e['category'] ?? '',
+          'photo_thumb':    e['photo_thumb'] ?? FieldValue.delete(),
+          ...picked,
+        });
+        tx.update(newRef, {'status': 'Borrowed'});
+        if (old?['status'] == 'Borrowed') tx.update(oldRef, {'status': 'Available'});
+        return {
+          'success': true,
+          'swapped': true,
+          'message': 'Handed over $name in place of ${t['equipment_name']}.',
+        };
+      });
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
+  }
+
+  // The loan a scanned unit belongs to, if it is waiting to be handed over:
+  // Scan QR then hands it over instead of offering a return.
+  static Future<List<dynamic>> awaitingRequestFor(String equipmentId) async {
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('equipment_id', isEqualTo: equipmentId)
+        .get();
+    final mine = _mapTransactionDocs(snap.docs).where(awaitingPickup).toList();
+    if (mine.isEmpty) return const [];
+    // The whole request: its other records share the student and borrow_date.
+    final key = requestKey(mine.first);
+    final all = await getStudentTransactions('${mine.first['student_id']}');
+    return all.where((t) => requestKey(t) == key).toList();
+  }
+
+  // Every unit of a request that is out, returned in good condition. A
+  // damaged one is returned on its own (Report Damage) before this.
+  static Future<Map<String, dynamic>> returnAll(List<dynamic> records) async {
+    final out = records.where(isOut).toList();
+    var done = 0;
+    String? firstError;
+    for (final t in out) {
+      final res = await returnEquipment('${t['transaction_id']}', 'Good');
+      if (res['success'] == true) {
+        done++;
+      } else {
+        firstError ??= '${res['message'] ?? 'Return failed.'}';
+      }
+    }
+    return {
+      'success': firstError == null && done > 0,
+      'done':    done,
+      'message': out.isEmpty
+          ? 'Nothing from this request is out on loan.'
+          : firstError == null
+              ? '$done ${done == 1 ? 'item' : 'items'} returned.'
+              : done == 0
+                  ? firstError
+                  : '$done of ${out.length} returned. $firstError',
+    };
+  }
+
+  // The student never came for an approved request: every unit still waiting
+  // goes back on the shelf, and the records end Cancelled with the reason.
+  static Future<Map<String, dynamic>> cancelNotPickedUp(List<dynamic> records) async {
+    var done = 0;
+    String? firstError;
+    for (final r in records.where(awaitingPickup)) {
+      try {
+        final txRef = _db.collection('borrow_transactions').doc('${r['transaction_id']}');
+        final res = await _db.runTransaction((tx) async {
+          final t = (await tx.get(txRef)).data();
+          if (t == null || !awaitingPickup(t)) {
+            return '${r['equipment_name'] ?? 'An item'} was handed over or '
+                'changed meanwhile.';
+          }
+          final eqRef = _db.collection('equipment').doc('${t['equipment_id']}');
+          final eq = (await tx.get(eqRef)).data();
+          tx.update(txRef, {
+            'status':            'Cancelled',
+            'awaiting_pickup':   FieldValue.delete(),
+            'cancel_reason':     'Not picked up',
+            'cancelled_at':      FieldValue.serverTimestamp(),
+            'cancelled_by':      Session.staffId,
+            'cancelled_by_name': Session.name,
+          });
+          if (eq?['status'] == 'Borrowed') tx.update(eqRef, {'status': 'Available'});
+          return null;
+        });
+        if (res == null) {
+          done++;
+        } else {
+          firstError ??= res;
+        }
+      } catch (e) {
+        firstError ??= friendlyError(e);
+      }
+    }
+    return {
+      'success': firstError == null && done > 0,
+      'done':    done,
+      'message': firstError == null
+          ? 'Marked not picked up. ${done == 1 ? 'The item is' : 'The items are'} '
+              'available again.'
+          : done == 0
+              ? firstError
+              : '$done cancelled. $firstError',
+    };
+  }
+
+  // Staff set the return time of a pending or approved request (10:00 PM is
+  // the usual latest; staff can give a later one, 2026-10-06). Every record of the
+  // request still Pending or Approved gets it, checked inside one
+  // transaction so a record returned meanwhile keeps its own deadline.
+  static Future<Map<String, dynamic>> setDueTime(
+      List<dynamic> records, DateTime due) async {
+    if (!due.isAfter(DateTime.now())) {
+      return {'success': false, 'message': 'Pick a time later than now.'};
+    }
+    try {
+      final refs = [
+        for (final t in records)
+          _db.collection('borrow_transactions').doc('${t['transaction_id']}'),
+      ];
+      final n = await _db.runTransaction((tx) async {
+        final live = <DocumentReference<Map<String, dynamic>>>[];
+        for (final ref in refs) {
+          final s = (await tx.get(ref)).data()?['status'];
+          if (s == 'Pending' || s == 'Approved') live.add(ref);
+        }
+        for (final ref in live) {
+          tx.update(ref, {
+            'due_date':        Timestamp.fromDate(due),
+            'due_set_by':      Session.staffId,
+            'due_set_by_name': Session.name,
+          });
+        }
+        return live.length;
+      });
+      if (n == 0) {
+        return {'success': false, 'message': 'This request is already finished.'};
+      }
+      return {'success': true, 'message': 'Return time changed.'};
+    } catch (e) {
+      return {'success': false, 'message': friendlyError(e)};
+    }
   }
 
   // ── Damage Report ─────────────────────────────────────────────────────────
@@ -1763,14 +2634,27 @@ class ApiService {
   static Future<Map<String, dynamic>> updateDamageReport(
       String reportId, String status, {String? equipmentId, String? equipmentStatus}) async {
     try {
-      await _db.collection('damage_reports').doc(reportId).update({
+      // One batch: the report, the unit, and (1.0.19) the type list, which
+      // counts a unit coming back from repair as in service again.
+      final batch = _db.batch();
+      batch.update(_db.collection('damage_reports').doc(reportId), {
         'status': status,
         'reviewed_at': FieldValue.serverTimestamp(),
       });
       if (equipmentId != null && equipmentId.isNotEmpty && equipmentStatus != null) {
-        await _db.collection('equipment').doc(equipmentId)
-            .update({'status': equipmentStatus});
+        final eqRef = _db.collection('equipment').doc(equipmentId);
+        final cur = (await eqRef.get()).data();
+        // A unit deleted meanwhile has nothing to update; the report still
+        // gets resolved.
+        if (cur != null) {
+          batch.update(eqRef, {'status': equipmentStatus});
+          if (await _keepingTypeList()) {
+            _addTypeWrite(batch, typeDelta(cur, {...cur, 'status': equipmentStatus}));
+          }
+        }
       }
+      await batch.commit();
+      forgetItemTypes();
       return {'success': true};
     } catch (e) {
       return {'success': false, 'message': friendlyError(e)};
@@ -1832,6 +2716,40 @@ class ApiService {
     return items;
   }
 
+  // One unit's records, newest first: its loan history on the staff side of
+  // the item's page (2026-10-06). A unit has few records, and the query is on
+  // one field, so Firestore's automatic index covers it.
+  static Future<List<dynamic>> getItemHistory(String equipmentId) async {
+    if (equipmentId.isEmpty) return [];
+    final snap = await _db
+        .collection('borrow_transactions')
+        .where('equipment_id', isEqualTo: equipmentId)
+        .get();
+    return _mapTransactionDocs(snap.docs);
+  }
+
+  // Every equipment record, by name: the web portal's QR-label sheets. One
+  // read per item (90 on 2026-10-06), only when staff ask for labels.
+  static Future<List<Map<String, dynamic>>> getAllEquipment() async {
+    final snap = await _db.collection('equipment').orderBy('equipment_name').get();
+    return [for (final d in snap.docs) {...d.data(), 'equipment_id': d.id}];
+  }
+
+  // How many items are in each status right now, for Reports. Counted
+  // server-side like the Inventory header (one small aggregation each).
+  static Future<Map<String, int>> getEquipmentStatusCounts() async {
+    final col = _db.collection('equipment');
+    const statuses = ['Available', 'Reserved', 'Borrowed', 'Under Repair', 'For Disposal'];
+    final counts = await Future.wait([
+      for (final s in statuses) col.where('status', isEqualTo: s).count().get(),
+      col.count().get(),
+    ]);
+    return {
+      for (var i = 0; i < statuses.length; i++) statuses[i]: counts[i].count ?? 0,
+      'Total': counts.last.count ?? 0,
+    };
+  }
+
   // A single student's borrow transactions (newest first) for the staff
   // student-detail view. Reuses the shared transaction mapper.
   static Future<List<dynamic>> getStudentTransactions(String studentId) async {
@@ -1879,8 +2797,8 @@ class ApiService {
             cond == 'For Disposal') {
           damages++;
         }
-      } else if (status == 'Approved') {
-        if (due != null && due.isBefore(ref)) overdue++;
+      } else if (isOverdue(t, now: ref)) {
+        overdue++;
       }
     }
     final flags = late + overdue + damages;
@@ -1910,6 +2828,9 @@ class ApiService {
   //     compared a return date with a due date, so it sank when a request was
   //     filed and rose when one was rejected.
   //   • overdue      — still out (Approved) and past due right now.
+  //   • 2026-10-06: an approved item still waiting at the lab is not a
+  //     borrowing yet, and Most Borrowed counts item types ("Beaker 1000 mL"),
+  //     not single units ("Beaker 1000 mL #3"), which staff could not use.
   static Map<String, dynamic> reportMetrics(List<dynamic> txns,
       {DateTime? now}) {
     final ref = now ?? DateTime.now();
@@ -1918,8 +2839,9 @@ class ApiService {
     for (final t in txns) {
       final status = '${t['status'] ?? ''}';
       if (status != 'Approved' && status != 'Returned') continue;
+      if (awaitingPickup(t)) continue;
       borrowings++;
-      final name = '${t['equipment_name'] ?? 'Unknown'}';
+      final name = baseNameOf('${t['equipment_name'] ?? 'Unknown'}');
       perItem[name] = (perItem[name] ?? 0) + 1;
       final due = asDate(t['due_date']);
       if (status == 'Returned') {
@@ -1928,7 +2850,7 @@ class ApiService {
         // A return with no recorded date cannot be shown to be late, so it is
         // not held against the student.
         if (due == null || ret == null || !ret.isAfter(due)) onTime++;
-      } else if (due != null && due.isBefore(ref)) {
+      } else if (isOverdue(t, now: ref)) {
         overdue++;
       }
     }
@@ -1948,11 +2870,76 @@ class ApiService {
   // borrowing gate can be unit-tested (see test/ and borrowEquipment).
   static List<dynamic> overdueLoans(List<dynamic> txns, {DateTime? now}) {
     final ref = now ?? DateTime.now();
-    return txns.where((t) {
-      if ('${t['status'] ?? ''}' != 'Approved') return false;
-      final due = asDate(t['due_date']);
-      return due != null && due.isBefore(ref);
-    }).toList();
+    return txns.where((t) => isOverdue(t, now: ref)).toList();
+  }
+
+  // ── Pick-up state (2026-10-06) ──
+  // Approval sets a request's units aside at the lab (awaiting_pickup); the
+  // loan starts when staff hand each one over (handOver). Records approved
+  // before this have no awaiting_pickup: they were handed over at approval.
+
+  // Approved, and still at the lab waiting for the student.
+  static bool awaitingPickup(dynamic t) =>
+      '${t['status'] ?? ''}' == 'Approved' && t['awaiting_pickup'] == true;
+
+  // Approved, and in the student's hands.
+  static bool isOut(dynamic t) =>
+      '${t['status'] ?? ''}' == 'Approved' && t['awaiting_pickup'] != true;
+
+  // Out and past its due time: the one overdue test every screen uses. An
+  // approved item nobody collected is not overdue; the student never had it.
+  static bool isOverdue(dynamic t, {DateTime? now}) {
+    if (!isOut(t)) return false;
+    final due = asDate(t['due_date']);
+    return due != null && due.isBefore(now ?? DateTime.now());
+  }
+
+  // What the Hand Over screen can do with a request (2026-10-07):
+  //   'waiting': something is still set aside for the student;
+  //   'done':    nothing waits, and something is in the student's hands;
+  //   'over':    nothing waits and nothing is out, because the request was
+  //              cancelled (Not picked up), rejected or returned meanwhile.
+  // The screen used to call 'over' "Everything is handed over." (live test
+  // 2026-10-07, U1).
+  static String handOverState(List<dynamic> records) {
+    if (records.any(awaitingPickup)) return 'waiting';
+    if (records.any(isOut)) return 'done';
+    return 'over';
+  }
+
+  // Cancelled by staff (Not picked up), not by the student. A staff cancel
+  // carries a reason and the staff member's name; a student's own cancel
+  // carries neither (cancelRequest).
+  static bool cancelledByStaff(dynamic t) =>
+      '${t['status'] ?? ''}' == 'Cancelled' &&
+      ('${t['cancel_reason'] ?? ''}'.trim().isNotEmpty ||
+          '${t['cancelled_by_name'] ?? ''}'.trim().isNotEmpty);
+
+  // What became of one record, in the plain words Reports, its workbook and
+  // an item's loan history use (2026-10-06). The stored statuses (Approved,
+  // Cancelled...) do not say whether an item was late or ever collected.
+  static String loanOutcome(dynamic t, {DateTime? now}) {
+    final status = '${t['status'] ?? ''}';
+    switch (status) {
+      case 'Pending':
+        return 'Waiting for approval';
+      case 'Approved':
+        if (awaitingPickup(t)) return 'Ready for pick-up';
+        return isOverdue(t, now: now) ? 'Overdue' : 'On loan';
+      case 'Returned':
+        final due = asDate(t['due_date']);
+        final ret = asDate(t['return_date']);
+        return due != null && ret != null && ret.isAfter(due)
+            ? 'Returned late'
+            : 'Returned on time';
+      case 'Cancelled':
+        if ('${t['cancel_reason'] ?? ''}' == 'Not picked up') return 'Not picked up';
+        return '${t['cancelled_by_name'] ?? ''}'.isEmpty
+            ? 'Cancelled by student'
+            : 'Cancelled by staff';
+      default:
+        return status; // Rejected, or anything unexpected, as stored
+    }
   }
 
   // ── Update Profile ────────────────────────────────────────────────────────

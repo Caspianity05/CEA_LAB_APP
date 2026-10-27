@@ -18,7 +18,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # of the product and file versions while build-number is used as the build suffix.
 # Keep in step with kAppVersion / kAppBuild in lib/constants.dart — the About
 # screen prints those, and they are how you tell two installed builds apart.
-version: 1.0.14+15
+version: 1.0.20+35
 
 environment:
   sdk: ^3.11.1
@@ -46,6 +46,14 @@ dependencies:
   image: ^4.2.0
   qr_flutter: ^4.1.0
   shared_preferences: ^2.3.2
+  # Browser APIs for the staff web portal (the Reports and QR-label downloads).
+  web: ^1.1.1
+  # Printable QR labels for the web portal's Inventory (2026-10-06): a PDF of
+  # A4 sheets. Pure Dart, so it runs in the browser.
+  pdf: ^3.11.0
+  # The Reports .xlsx workbook is a zip of XML parts (report_xlsx.dart). The
+  # app already had this through `image`; listed because it is used directly.
+  archive: ^4.0.0
 
 dev_dependencies:
   flutter_test:

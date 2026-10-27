@@ -5,20 +5,26 @@
 // 2026-10-05: Pending shows one card per request (a request can hold several
 // units, see request_card.dart); the lists no longer read the whole
 // borrow_transactions collection (Pending/Approved live, All = last 90 days).
+// 2026-10-06: Approved shows one card per request too, ready for pick-up or on
+// loan, with Hand over / Not picked up / Return all (loan_card.dart).
 // -----------------------------------------------------------------------------
 
 
 import 'package:flutter/material.dart';
 
+import '../../constants.dart';
 import '../../services/api_service.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
+import 'loan_card.dart';
 import 'request_card.dart';
 
 // ─── Admin Requests Screen ────────────────────────────────────────────────────
 
 class AdminRequestsScreen extends StatefulWidget {
-  const AdminRequestsScreen({super.key});
+  // 0 = Pending, 1 = Approved, 2 = All (the Dashboard's "View all" links).
+  final int initialTab;
+  const AdminRequestsScreen({super.key, this.initialTab = 0});
   @override
   State<AdminRequestsScreen> createState() => _AdminRequestsScreenState();
 }
@@ -30,19 +36,13 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
   late final Stream<List<dynamic>> _stream = ApiService.requestsStream();
   late final Stream<List<dynamic>> _recent = ApiService.recentRequestsStream();
 
-  // True when this loan's due date has gone by. Uses the shared parser so an
-  // ISO string and a raw Firestore Timestamp are both handled.
-  bool _isPastDue(dynamic e) {
-    final due = ApiService.asDate(e['due_date']);
-    return due != null && due.isBefore(DateTime.now());
-  }
-
   Color _statusColor(String s) {
     switch (s) {
       case 'Pending':  return AppTheme.accent;
       case 'Approved': return AppTheme.success;
       case 'Returned': return AppTheme.textMid;
       case 'Rejected': return AppTheme.danger;
+      case 'Cancelled': return AppTheme.textLight;
       default:         return AppTheme.textMid;
     }
   }
@@ -54,6 +54,9 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
       final res = await ApiService.decideRequest(
           [for (final t in request) '${t['transaction_id']}'], action,
           reason: reason);
+      if (mounted && res['success'] == true && action == 'approve') {
+        offerHandOver(context, request);
+      }
       if (mounted && res['success'] != true) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(res['message'] ?? 'Action failed.'),
@@ -83,24 +86,48 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
     if (status == 'Returned' && '${e['returned_by_name'] ?? ''}'.isNotEmpty) {
       return 'Returned to ${e['returned_by_name']}';
     }
+    // Students cancel their own pending requests (2026-10-06); a cancel by
+    // staff names who did it.
+    if (status == 'Cancelled') {
+      final by = '${e['cancelled_by_name'] ?? ''}';
+      return by.isNotEmpty ? 'Cancelled by $by' : 'Cancelled by the student';
+    }
     return '';
   }
 
-  // One record (one unit), for the Approved and All tabs: each unit is
-  // returned on its own, so these stay one card per unit.
+  // One record (one unit), for the All tab.
   Widget _buildCard(dynamic e) {
-    final status = e['status'] ?? '';
+    final status = '${e['status'] ?? ''}';
     // An Approved loan that is past its due date is overdue, and the badge
     // used to say plain "Approved" in green — so the Approved tab gave staff
     // no way to spot a late loan (QA 2026-09-19, low #8). The stored status
-    // is unchanged; only the badge tells the truth about it.
-    final isOverdue = status == 'Approved' && _isPastDue(e);
-    final label = isOverdue ? 'Overdue' : status;
-    final sc = isOverdue ? AppTheme.danger : _statusColor(status);
+    // is unchanged; only the badge tells the truth about it. Likewise an
+    // approved unit still at the lab, and a request nobody collected
+    // (2026-10-06).
+    final isOverdue = ApiService.isOverdue(e);
+    final ready = ApiService.awaitingPickup(e);
+    final notPickedUp = status == 'Cancelled' && e['cancel_reason'] == 'Not picked up';
+    final label = isOverdue
+        ? 'Overdue'
+        : ready
+            ? 'Ready for pick-up'
+            : notPickedUp
+                ? 'Not picked up'
+                : status;
+    final sc = isOverdue
+        ? AppTheme.danger
+        : ready
+            ? AppTheme.primary
+            : _statusColor(status);
     // Always a String: `.isNotEmpty` and `[0]` below would throw on any other
     // stored type and blank the card (QA 2026-10-03).
     final studentName = '${e['borrower_name'] ?? e['student_number'] ?? ''}';
-    final subject = '${e['subject'] ?? ''}'.trim();
+    final s = '${e['subject'] ?? ''}'.trim();
+    final w = '${e['use_location'] ?? ''}'.trim();
+    final subject = joinParts([
+      if (s.isNotEmpty) 'Subject: $s',
+      if (w.isNotEmpty) 'Where: $w',
+    ]);
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
@@ -127,7 +154,7 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
             child: Row(children: [
               const Icon(Icons.science_outlined, size: 13, color: AppTheme.textMid),
               const SizedBox(width: 6),
-              Expanded(child: Text('${e['equipment_name'] ?? ''}  •  ${e['qr_code'] ?? ''}',
+              Expanded(child: Text(joinParts([e['equipment_name'], e['qr_code']]),
                   style: const TextStyle(fontSize: 12, color: AppTheme.textDark, fontWeight: FontWeight.w600))),
               const Icon(Icons.calendar_today_rounded, size: 13, color: AppTheme.textMid),
               const SizedBox(width: 4),
@@ -137,7 +164,7 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
           ),
           if (subject.isNotEmpty) ...[
             const SizedBox(height: 6),
-            Text('Subject: $subject',
+            Text(subject,
                 style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
           ],
           if (status == 'Rejected' && '${e['reject_reason'] ?? ''}'.isNotEmpty) ...[
@@ -168,31 +195,57 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
           padding: const EdgeInsets.all(32),
           child: Text(text, style: const TextStyle(color: AppTheme.textMid))));
 
+  // Both lists put their cards in rows on a wide window (gridRows).
   Widget _pendingList(List<dynamic> pending) {
     final requests = ApiService.groupRequests(pending);
-    return ListView(padding: const EdgeInsets.all(16), children: [
-      if (requests.isEmpty) _empty('No pending requests'),
-      for (final request in requests)
-        PendingRequestCard(
-          request: request,
-          onApprove: () => _decide(request, 'approve'),
-          onReject: () => _confirmReject(request),
-        ),
-    ]);
+    return LayoutBuilder(
+      builder: (context, box) => ListView(padding: const EdgeInsets.all(16), children: [
+        if (requests.isEmpty) _empty('No pending requests'),
+        ...gridRows([
+          for (final request in requests)
+            PendingRequestCard(
+              request: request,
+              onApprove: () => _decide(request, 'approve'),
+              onReject: () => _confirmReject(request),
+            ),
+        ], gridColumns(box.maxWidth - 32)),
+      ]),
+    );
+  }
+
+  // Approved requests, one card per request and state: ready for pick-up
+  // first (someone may be waiting at the counter), then on loan.
+  Widget _loanList(List<dynamic> approved) {
+    final cards = ApiService.groupRequests(approved, byPickup: true)
+      ..sort((a, b) {
+        final ar = a.any(ApiService.awaitingPickup) ? 0 : 1;
+        final br = b.any(ApiService.awaitingPickup) ? 0 : 1;
+        return ar.compareTo(br);
+      });
+    return LayoutBuilder(
+      builder: (context, box) => ListView(padding: const EdgeInsets.all(16), children: [
+        if (cards.isEmpty) _empty('No approved requests'),
+        ...gridRows([for (final request in cards) LoanRequestCard(request: request)],
+            gridColumns(box.maxWidth - 32)),
+      ]),
+    );
   }
 
   Widget _recordList(List<dynamic> items, String emptyText, {String? footer}) {
-    return ListView(padding: const EdgeInsets.all(16), children: [
-      if (items.isEmpty) _empty(emptyText),
-      for (final e in items) _buildCard(e),
-      if (footer != null && items.isNotEmpty)
-        Padding(
-          padding: const EdgeInsets.only(top: 4, bottom: 8),
-          child: Center(
-              child: Text(footer,
-                  style: const TextStyle(fontSize: 11, color: AppTheme.textLight))),
-        ),
-    ]);
+    return LayoutBuilder(
+      builder: (context, box) => ListView(padding: const EdgeInsets.all(16), children: [
+        if (items.isEmpty) _empty(emptyText),
+        ...gridRows([for (final e in items) _buildCard(e)],
+            gridColumns(box.maxWidth - 32)),
+        if (footer != null && items.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 8),
+            child: Center(
+                child: Text(footer,
+                    style: const TextStyle(fontSize: 11, color: AppTheme.textLight))),
+          ),
+      ]),
+    );
   }
 
   @override
@@ -217,6 +270,7 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
 
         return DefaultTabController(
           length: 3,
+          initialIndex: widget.initialTab,
           child: Scaffold(
             appBar: AppBar(
               // No title: the staff shell's AppBar already shows the tab name,
@@ -231,7 +285,7 @@ class _AdminRequestsScreenState extends State<AdminRequestsScreen> {
             ),
             body: TabBarView(children: [
               _pendingList(pending),
-              _recordList(approved, 'No approved requests'),
+              _loanList(approved),
               StreamBuilder<List<dynamic>>(
                 stream: _recent,
                 builder: (context, recent) {

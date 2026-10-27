@@ -81,10 +81,16 @@ service cloud.firestore {
         || p.created_at < timestamp.date(2026, 8, 3);
     }
 
-    // Public lookup so a student can resolve their student number → email
-    // BEFORE authenticating. Holds only {email, uid}. Hardened:
-    //   • get-only — list is blocked so the collection cannot be dumped to
-    //     harvest student emails (Data Privacy Act of 2012 consideration).
+    // Student number → account index. Holds only {email, uid}. Its job is to
+    // make a student number registrable once: registration CREATES the entry,
+    // and a create on a taken number is refused. Hardened:
+    //   • nobody reads it from a client (2026-10-13, pen test R3). It used to
+    //     be readable one entry at a time, before sign-in, because students
+    //     signed in with their student number and the app resolved it to an
+    //     email here. That let anyone turn a guessed number into a student's
+    //     email (Data Privacy Act of 2012 consideration). Students now sign in
+    //     with their email, so no read is needed; the rules' own getAfter()
+    //     below is not a client read and still works.
     //   • create must carry the caller's own uid and token email, so one
     //     account cannot "squat" another student's number.
     //   • ONE number per account, and only the number on the caller's own
@@ -100,7 +106,7 @@ service cloud.firestore {
     //     only ever for rolling back a half-finished registration, and the
     //     batch makes that impossible: both writes land or neither does.
     match /student_lookup/{studentNumber} {
-      allow get:    if true;
+      allow get:    if false;
       allow list:   if false;
       allow create: if signedIn()
         && request.resource.data.keys().hasOnly(['email', 'uid'])
@@ -206,13 +212,58 @@ service cloud.firestore {
               || staffRoleOk(request.resource.data.role)));
     }
 
-    // Equipment is readable by any signed-in user; only managers may change it.
+    // Equipment is readable by any signed-in user; only managers may change it,
+    // with two narrow exceptions for students (2026-10-06, reservations):
+    //   • the batch that sends a request marks each requested unit Reserved, so
+    //     no one else can ask for it while staff decide. Allowed only from
+    //     Available, only for a Pending request of the caller's that names this
+    //     unit (read after the batch), and only the reservation fields change;
+    //   • cancelling that request frees the unit again: Reserved back to
+    //     Available, only by the student who reserved it, and only when the
+    //     request it names ends up Cancelled.
+    // Each student check reads one document (the request, as the batch leaves
+    // it), and only once everything cheaper has passed. The student checks
+    // come before isManager() so a student's batch never spends a read on
+    // the staff list: an 8-unit request then needs 17 reads (the profile, and
+    // the unit and its request for each unit), inside the 20 a batch may use.
     // The small list thumbnail is stored on the document itself as photo_thumb.
     match /equipment/{id} {
       allow read:   if signedIn();
       allow create: if isManager();
-      allow update: if isManager();
+      allow update: if studentReserveOk() || studentReleaseOk() || isManager();
       allow delete: if isManager();
+
+      function reservationOnly() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'reserved_tx', 'reserved_by']);
+      }
+      // The request [txId] once this batch is applied: the caller's, about
+      // this unit, and in [status].
+      function myRequestIs(txId, status) {
+        let t = getAfter(/databases/$(database)/documents/borrow_transactions/$(txId)).data;
+        return t.student_id == request.auth.uid
+          && t.equipment_id == id
+          && t.status == status;
+      }
+      function studentReserveOk() {
+        return signedIn()
+          && reservationOnly()
+          && resource.data.status == 'Available'
+          && request.resource.data.status == 'Reserved'
+          && request.resource.data.reserved_by == request.auth.uid
+          && request.resource.data.reserved_tx is string
+          && myRequestIs(request.resource.data.reserved_tx, 'Pending');
+      }
+      function studentReleaseOk() {
+        return signedIn()
+          && reservationOnly()
+          && resource.data.status == 'Reserved'
+          && resource.data.reserved_by == request.auth.uid
+          && request.resource.data.status == 'Available'
+          && !('reserved_tx' in request.resource.data)
+          && !('reserved_by' in request.resource.data)
+          && myRequestIs(resource.data.reserved_tx, 'Cancelled');
+      }
     }
 
     // Full-size equipment photos, one document per equipment item, keyed by the
@@ -220,6 +271,16 @@ service cloud.firestore {
     // requires the paid Blaze plan; these are only read when a detail screen
     // opens, so they stay out of every list query.
     match /equipment_photos/{id} {
+      allow read:   if signedIn();
+      allow write:  if isManager();
+    }
+
+    // The item-type list (1.0.19, 2026-10-15): one document, equipment_types/all,
+    // that sums the inventory up by type (units, units out of service, category,
+    // programs), so the catalog and the borrow form read it instead of every
+    // unit. Staff keep it current in the same batch as each unit change;
+    // students only read it. Availability is not stored here, only counted.
+    match /equipment_types/{id} {
       allow read:   if signedIn();
       allow write:  if isManager();
     }
@@ -233,8 +294,10 @@ service cloud.firestore {
     //     raw caller cannot pre-fill the approval audit trail and make a
     //     request look as though staff had already signed it off (P03);
     //   • the deadline must fall inside 24 hours — the server-side floor under
-    //     the same-day 5:00 PM policy the form enforces. Without it a raw
-    //     caller could ask for a months-long loan (P02).
+    //     the same-day 10:00 PM policy the form enforces. Without it a raw
+    //     caller could ask for a months-long loan (P02);
+    //   • subject and use_location (where the items will be used) are
+    //     required, so staff can trace every borrower (1.0.20, 2026-10-19).
     // And from 2026-10-03 (R2), every copied value must match its source:
     //   • borrower_name / student_number are the caller's OWN profile values,
     //     which is what borrowEquipment writes (QA H5). Staff read these on
@@ -256,8 +319,8 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly([
              'student_id', 'equipment_id', 'equipment_name', 'qr_code',
              'photo_thumb', 'category', 'borrower_name', 'student_number',
-             'subject', 'quantity', 'purpose', 'borrow_date', 'due_date',
-             'return_date', 'status'])
+             'subject', 'use_location', 'quantity', 'purpose', 'borrow_date',
+             'due_date', 'return_date', 'status'])
         && 'due_date' in request.resource.data
         && request.resource.data.due_date is timestamp
         && request.resource.data.due_date < request.time + duration.value(1, 'd')
@@ -267,13 +330,29 @@ service cloud.firestore {
         && request.resource.data.quantity >= 1
         && request.resource.data.quantity <= 10
         && request.resource.data.subject is string
+        && request.resource.data.subject.trim().size() >= 1
         && request.resource.data.subject.size() <= 200
+        && request.resource.data.use_location is string
+        && request.resource.data.use_location.trim().size() >= 1
+        && request.resource.data.use_location.size() <= 200
         && request.resource.data.purpose is string
         && request.resource.data.purpose.size() <= 2000
         && borrowerOk()
         && equipmentOk();
-      allow update: if isManager();
+      // Staff decide; a student may only cancel their own request while it is
+      // still Pending (2026-10-06), and nothing else about it.
+      allow update: if studentCancelOk() || isManager();
       allow delete: if false;
+
+      function studentCancelOk() {
+        return signedIn()
+          && resource.data.student_id == request.auth.uid
+          && resource.data.status == 'Pending'
+          && request.resource.data.status == 'Cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['status', 'cancelled_at'])
+          && request.resource.data.cancelled_at == request.time;
+      }
 
       // The requester: not on hold, past the e-mail gate, and named on the
       // request exactly as their own profile names them.

@@ -165,6 +165,71 @@ class _AdminDamageReportsScreenState extends State<AdminDamageReportsScreen> {
       backgroundColor: AppTheme.danger, behavior: SnackBarBehavior.floating));
   }
 
+  // One damage report card: a list row on a phone, one cell of a grid row on
+  // a wide window.
+  Widget _reportCard(int i) {
+    final r = _reports[i];
+    final status = '${r['status'] ?? 'Open'}';
+    final sc = _statusColor(status);
+    final date = '${r['reported_at'] ?? ''}'.split('T').first;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border(left: BorderSide(color: sc, width: 4)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.report_problem_outlined,
+              color: AppTheme.warning, size: 20),
+          const SizedBox(width: 8),
+          Expanded(child: Text('${r['equipment_name'] ?? 'Equipment'}',
+              style: const TextStyle(fontWeight: FontWeight.bold,
+                  fontSize: 14, color: AppTheme.textDark))),
+          StatusBadge(label: status, color: sc),
+        ]),
+        const SizedBox(height: 8),
+        Text('${r['description'] ?? ''}',
+            style: const TextStyle(fontSize: 13,
+                color: AppTheme.textMid, height: 1.5)),
+        const SizedBox(height: 8),
+        Row(children: [
+          const Icon(Icons.person_outline_rounded, size: 13, color: AppTheme.textLight),
+          const SizedBox(width: 4),
+          Expanded(child: Text(
+              '${r['borrower_name'] ?? r['student_number'] ?? '—'}',
+              style: const TextStyle(fontSize: 12, color: AppTheme.textMid))),
+          const Icon(Icons.calendar_today_rounded, size: 12, color: AppTheme.textLight),
+          const SizedBox(width: 4),
+          Text(date, style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
+        ]),
+        if (Session.canManage && status != 'Resolved') ...[
+          const SizedBox(height: 12),
+          const Divider(height: 1, color: AppTheme.divider),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: OutlinedButton.icon(
+              onPressed: () => _holdBorrower(r),
+              icon: const Icon(Icons.gpp_maybe_outlined, size: 16),
+              label: const Text('Hold'),
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: AppTheme.danger,
+                  side: const BorderSide(color: AppTheme.danger)),
+            )),
+            const SizedBox(width: 10),
+            Expanded(child: ElevatedButton.icon(
+              onPressed: () => _resolve(r),
+              icon: const Icon(Icons.check_rounded, size: 16),
+              label: const Text('Resolve'),
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
+            )),
+          ]),
+        ],
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -181,73 +246,19 @@ class _AdminDamageReportsScreenState extends State<AdminDamageReportsScreen> {
                 )
               : RefreshIndicator(
                   onRefresh: _load,
-                  child: ListView.separated(
-                    padding: const EdgeInsets.all(16),
-                    itemCount: _reports.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 10),
-                    itemBuilder: (_, i) {
-                      final r = _reports[i];
-                      final status = '${r['status'] ?? 'Open'}';
-                      final sc = _statusColor(status);
-                      final date = '${r['reported_at'] ?? ''}'.split('T').first;
-                      return Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border(left: BorderSide(color: sc, width: 4)),
-                        ),
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                          Row(children: [
-                            const Icon(Icons.report_problem_outlined,
-                                color: AppTheme.warning, size: 20),
-                            const SizedBox(width: 8),
-                            Expanded(child: Text('${r['equipment_name'] ?? 'Equipment'}',
-                                style: const TextStyle(fontWeight: FontWeight.bold,
-                                    fontSize: 14, color: AppTheme.textDark))),
-                            StatusBadge(label: status, color: sc),
-                          ]),
-                          const SizedBox(height: 8),
-                          Text('${r['description'] ?? ''}',
-                              style: const TextStyle(fontSize: 13,
-                                  color: AppTheme.textMid, height: 1.5)),
-                          const SizedBox(height: 8),
-                          Row(children: [
-                            const Icon(Icons.person_outline_rounded, size: 13, color: AppTheme.textLight),
-                            const SizedBox(width: 4),
-                            Expanded(child: Text(
-                                '${r['borrower_name'] ?? r['student_number'] ?? '—'}',
-                                style: const TextStyle(fontSize: 12, color: AppTheme.textMid))),
-                            const Icon(Icons.calendar_today_rounded, size: 12, color: AppTheme.textLight),
-                            const SizedBox(width: 4),
-                            Text(date, style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
-                          ]),
-                          if (Session.canManage && status != 'Resolved') ...[
-                            const SizedBox(height: 12),
-                            const Divider(height: 1, color: AppTheme.divider),
-                            const SizedBox(height: 10),
-                            Row(children: [
-                              Expanded(child: OutlinedButton.icon(
-                                onPressed: () => _holdBorrower(r),
-                                icon: const Icon(Icons.gpp_maybe_outlined, size: 16),
-                                label: const Text('Hold'),
-                                style: OutlinedButton.styleFrom(
-                                    foregroundColor: AppTheme.danger,
-                                    side: const BorderSide(color: AppTheme.danger)),
-                              )),
-                              const SizedBox(width: 10),
-                              Expanded(child: ElevatedButton.icon(
-                                onPressed: () => _resolve(r),
-                                icon: const Icon(Icons.check_rounded, size: 16),
-                                label: const Text('Resolve'),
-                                style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
-                              )),
-                            ]),
-                          ],
-                        ]),
-                      );
-                    },
-                  ),
+                  child: LayoutBuilder(builder: (context, box) {
+                    // Rows of cards on a wide window, one card per row on a phone.
+                    final cols = gridColumns(box.maxWidth - 32);
+                    final rows = (_reports.length + cols - 1) ~/ cols;
+                    return ListView.separated(
+                      padding: const EdgeInsets.all(16),
+                      itemCount: rows,
+                      separatorBuilder: (_, _) => const SizedBox(height: 10),
+                      itemBuilder: (_, row) {
+                        return gridRow(row, cols, _reports.length, _reportCard);
+                      },
+                    );
+                  }),
                 ),
     );
   }

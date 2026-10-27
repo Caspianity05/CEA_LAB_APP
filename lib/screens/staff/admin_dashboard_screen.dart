@@ -7,6 +7,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import '../../constants.dart';
@@ -24,8 +25,8 @@ import 'admin_penalties_screen.dart';
 import 'admin_students_screen.dart';
 import 'staff_profile_screen.dart';
 import 'admin_staff_accounts_screen.dart';
+import 'loan_card.dart';
 import 'request_card.dart';
-import 'return_flow.dart';
 
 // ─── Admin Dashboard Screen ────────────────────────────────────────────────────
 
@@ -38,6 +39,8 @@ class AdminDashboardScreen extends StatefulWidget {
 class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   int _currentIndex = 0;
   StreamSubscription<Map<String, dynamic>?>? _account;
+  // The Dashboard tab, so the portal's Refresh button can reload it.
+  final _homeKey = GlobalKey<_AdminHomeState>();
 
   @override
   void initState() {
@@ -121,12 +124,23 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   // A new instance of the same type rebuilds the subtree while keeping its
   // State, so the stats already loaded are not re-fetched.
   List<Widget> get _pages => [
-        // ignore: prefer_const_constructors
-        _AdminHome(),
-        const AdminRequestsScreen(),
+        _AdminHome(key: _homeKey, onViewAll: _openRequests),
+        AdminRequestsScreen(initialTab: _requestsTab),
         const AdminInventoryScreen(),
         const AdminReportsScreen(),
       ];
+
+  // The Dashboard's "View all" links open Requests on the matching tab
+  // (Pending or Approved); they used to do nothing.
+  int _requestsTab = 0;
+  void _openRequests(int tab) => setState(() {
+        _requestsTab = tab;
+        _currentIndex = 1;
+      });
+  void _openTab(int i) => setState(() {
+        _requestsTab = 0;
+        _currentIndex = i;
+      });
 
   void _confirmSignOut(BuildContext context) {
     showDialog(
@@ -169,6 +183,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final tabTitles = ['Dashboard', 'Requests', 'Inventory', 'Reports'];
+    final wide = MediaQuery.sizeOf(context).width >= 900;
     return Scaffold(
       appBar: AppBar(
         title: Row(
@@ -180,6 +195,16 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           ],
         ),
         actions: [
+          // The Dashboard is read once when it opens. A phone pulls it down to
+          // reload; a mouse cannot, so on the portal a new request stayed out
+          // of sight until staff switched tabs or reloaded the page (portal QA
+          // 2026-10-15). The portal gets a Refresh button instead.
+          if (kIsWeb && _currentIndex == 0)
+            IconButton(
+              tooltip: 'Refresh',
+              icon: const Icon(Icons.refresh_rounded, color: Colors.white),
+              onPressed: () => _homeKey.currentState?._load(),
+            ),
           IconButton(
             tooltip: 'My Profile',
             icon: const Icon(Icons.account_circle_outlined, color: Colors.white),
@@ -200,8 +225,42 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           ),
         ],
       ),
-      body: Column(
+      body: Row(
         children: [
+          // A wide window (the web staff portal on a monitor) gets a side
+          // rail instead of the phone's bottom bar (prof's comment 2026-10-05).
+          if (wide) ...[
+            NavigationRail(
+              selectedIndex: _currentIndex,
+              onDestinationSelected: _openTab,
+              labelType: NavigationRailLabelType.all,
+              backgroundColor: Colors.white,
+              selectedIconTheme: const IconThemeData(color: AppTheme.primary),
+              selectedLabelTextStyle: const TextStyle(
+                  color: AppTheme.primary, fontWeight: FontWeight.w600, fontSize: 12),
+              unselectedLabelTextStyle:
+                  const TextStyle(color: AppTheme.textMid, fontSize: 12),
+              destinations: const [
+                NavigationRailDestination(
+                    icon: Icon(Icons.dashboard_outlined),
+                    selectedIcon: Icon(Icons.dashboard_rounded),
+                    label: Text('Dashboard')),
+                NavigationRailDestination(
+                    icon: Icon(Icons.assignment_outlined),
+                    selectedIcon: Icon(Icons.assignment_rounded),
+                    label: Text('Requests')),
+                NavigationRailDestination(
+                    icon: Icon(Icons.inventory_2_outlined),
+                    selectedIcon: Icon(Icons.inventory_2_rounded),
+                    label: Text('Inventory')),
+                NavigationRailDestination(
+                    icon: Icon(Icons.bar_chart_outlined),
+                    selectedIcon: Icon(Icons.bar_chart_rounded),
+                    label: Text('Reports')),
+              ],
+            ),
+            const VerticalDivider(width: 1, color: AppTheme.divider),
+          ],
           // Keyed on the access level so a change picked up by _onAccount
           // rebuilds the open tab from scratch. Three of the four pages are
           // const, and setState skips a const page, so their Approve and Edit
@@ -214,7 +273,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           ),
         ],
       ),
-      bottomNavigationBar: Container(
+      bottomNavigationBar: wide ? null : Container(
         decoration: const BoxDecoration(
           color: Colors.white,
           boxShadow: [
@@ -223,7 +282,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
         ),
         child: BottomNavigationBar(
           currentIndex: _currentIndex,
-          onTap: (i) => setState(() => _currentIndex = i),
+          onTap: _openTab,
           type: BottomNavigationBarType.fixed,
           selectedItemColor: AppTheme.primary,
           unselectedItemColor: AppTheme.textLight,
@@ -254,7 +313,9 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
 }
 
 class _AdminHome extends StatefulWidget {
-  const _AdminHome();
+  // Opens the Requests tab: 0 = Pending, 1 = Approved.
+  final void Function(int tab) onViewAll;
+  const _AdminHome({super.key, required this.onViewAll});
   @override
   State<_AdminHome> createState() => _AdminHomeState();
 }
@@ -286,6 +347,9 @@ class _AdminHomeState extends State<_AdminHome> {
   }
 
   Future<void> _load() async {
+    // Cards and the hand-over snackbar call this when their action ends,
+    // which can be after staff moved to another tab (2026-10-07).
+    if (!mounted) return;
     setState(() => _loading = true);
     try {
       final data = await ApiService.getDashboardData();
@@ -322,6 +386,11 @@ class _AdminHomeState extends State<_AdminHome> {
   Future<void> _approve(List<dynamic> request) async {
     final res = await ApiService.decideRequest(
         [for (final t in request) '${t['transaction_id']}'], 'approve');
+    if (res['success'] == true && mounted) {
+      offerHandOver(context, request, onDone: _load);
+      _load();
+      return;
+    }
     _showResult(res, 'Request approved.');
   }
 
@@ -334,37 +403,164 @@ class _AdminHomeState extends State<_AdminHome> {
     _showResult(res, 'Request rejected.');
   }
 
-  // The same Good / Report Damage step as Scan QR (return_flow.dart). This
-  // used to be a plain confirm that always recorded Good, so a damaged item
-  // returned from here could not be logged (prof's comment 2026-10-05).
-  Future<void> _return(dynamic loan) async {
-    await showReturnSheet(
-      context,
-      equipment: {
-        'equipment_id':   loan['equipment_id'],
-        'equipment_name': loan['equipment_name'],
-        'qr_code':        loan['qr_code'],
-        'category':       loan['category'],
-        'status':         'Borrowed',
-      },
-      closeLabel: 'Cancel',
-      doReturn: (condition) async {
-        final res =
-            await ApiService.returnEquipment('${loan['transaction_id']}', condition);
-        // The damage follow-up needs to know whose loan it was.
-        return {
-          ...res,
-          'student_id':     '${loan['student_id'] ?? ''}',
-          'borrower_name':  '${loan['borrower_name'] ?? loan['student_number'] ?? ''}',
-          'student_number': '${loan['student_number'] ?? ''}',
-        };
-      },
-    );
-    if (mounted) _load();
+  // ── Pending Approvals ──
+  List<Widget> _pendingSection() => [
+        SectionHeader(
+            title: 'Pending Approvals (${ApiService.groupRequests(_pending).length})',
+            action: 'View all',
+            onAction: () => widget.onViewAll(0)),
+        const SizedBox(height: 12),
+        if (_pending.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16)),
+            child: const Center(
+              child: Column(children: [
+                Icon(Icons.check_circle_outline_rounded,
+                    color: AppTheme.success, size: 36),
+                SizedBox(height: 8),
+                Text('No pending requests',
+                    style: TextStyle(color: AppTheme.textMid, fontSize: 13)),
+              ]),
+            ),
+          )
+        else
+          // One card per request, however many units it holds.
+          for (final request in ApiService.groupRequests(_pending))
+            PendingRequestCard(
+              request: request,
+              onApprove: () => _approve(request),
+              onReject: () => _reject(request),
+              onChanged: _load,
+            ),
+      ];
+
+  Widget _emptyCard(String text) => Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+            color: Colors.white, borderRadius: BorderRadius.circular(16)),
+        child: Center(
+          child: Text(text, style: const TextStyle(color: AppTheme.textMid, fontSize: 13)),
+        ),
+      );
+
+  // ── Approved requests: ready for pick-up, then on loan ──
+  // One card per request and state (loan_card.dart). Approval sets the items
+  // aside at the lab; they are on loan once staff hand them over (2026-10-06).
+  // Each card returns, hands over or changes the time itself, then reloads
+  // this one-shot list. Overdue loans are badged on their card.
+  List<Widget> _activeSection() {
+    final cards = ApiService.groupRequests(_approved, byPickup: true);
+    final ready = cards.where((r) => r.any(ApiService.awaitingPickup)).toList();
+    final out   = cards.where((r) => !r.any(ApiService.awaitingPickup)).toList();
+    return [
+      SectionHeader(
+          title: 'Ready for Pick-up (${ready.length})',
+          action: 'View all',
+          onAction: () => widget.onViewAll(1)),
+      const SizedBox(height: 12),
+      if (ready.isEmpty) _emptyCard('Nothing waiting to be picked up'),
+      for (final request in ready) LoanRequestCard(request: request, onChanged: _load),
+      const SizedBox(height: 24),
+      SectionHeader(
+          title: 'On Loan (${out.fold<int>(0, (n, r) => n + r.length)})',
+          action: 'View all',
+          onAction: () => widget.onViewAll(1)),
+      const SizedBox(height: 12),
+      if (out.isEmpty) _emptyCard('No active loans'),
+      for (final request in out) LoanRequestCard(request: request, onChanged: _load),
+    ];
   }
 
   @override
   Widget build(BuildContext context) {
+    // Two stat cards per row on a phone, three on a wide browser window, all
+    // six in one row on a full-size monitor.
+    final width = MediaQuery.sizeOf(context).width;
+    final statsPerRow = width >= 1400 ? 6 : width >= 900 ? 3 : 2;
+    final stats = [
+      _AdminStatCard(
+          label: 'Pending Requests',
+          value: '${_stats['pending_requests'] ?? 0}',
+          icon: Icons.pending_actions_rounded,
+          color: AppTheme.accent),
+      _AdminStatCard(
+          label: 'Active Loans',
+          value: '${_stats['active_loans'] ?? 0}',
+          icon: Icons.inventory_2_rounded,
+          color: AppTheme.success),
+      _AdminStatCard(
+          label: 'Overdue Items',
+          value: '${_stats['overdue_loans'] ?? 0}',
+          icon: Icons.warning_amber_rounded,
+          color: AppTheme.danger),
+      _AdminStatCard(
+          label: 'Total Equipment',
+          value: '${_stats['total_equipment'] ?? 0}',
+          icon: Icons.science_rounded,
+          color: AppTheme.primary),
+      _AdminStatCard(
+          label: 'Registered Students',
+          value: '${_stats['total_students'] ?? 0}',
+          icon: Icons.people_alt_rounded,
+          color: AppTheme.primary),
+      _AdminStatCard(
+          label: 'Students on Hold',
+          value: '${_stats['held_students'] ?? 0}',
+          icon: Icons.gpp_bad_rounded,
+          color: AppTheme.danger),
+    ];
+    final processReturn = ElevatedButton.icon(
+      onPressed: () => _openThenReload(const QRScanScreen()),
+      icon: const Icon(Icons.qr_code_scanner_rounded),
+      label: Text(kIsWeb ? 'Hand Over or Return' : 'Scan QR: Hand Over or Return'),
+      style: ElevatedButton.styleFrom(
+        backgroundColor: AppTheme.primary,
+        padding: const EdgeInsets.symmetric(vertical: 14),
+      ),
+    );
+    final damage = OutlinedButton.icon(
+      onPressed: () => _openThenReload(const AdminDamageReportsScreen()),
+      icon: const Icon(Icons.report_problem_outlined, size: 18),
+      label: Text('Damage (${_stats['damage_reports'] ?? 0})'),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: AppTheme.warning,
+        side: const BorderSide(color: AppTheme.warning),
+        padding: const EdgeInsets.symmetric(vertical: 12),
+      ),
+    );
+    final penalties = OutlinedButton.icon(
+      onPressed: () => _openThenReload(const AdminPenaltiesScreen()),
+      icon: const Icon(Icons.gpp_maybe_outlined, size: 18),
+      label: const Text('Penalties'),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: AppTheme.danger,
+        side: const BorderSide(color: AppTheme.danger),
+        padding: const EdgeInsets.symmetric(vertical: 12),
+      ),
+    );
+    final staffAccounts = OutlinedButton.icon(
+      onPressed: () => _openThenReload(const AdminStaffAccountsScreen()),
+      icon: const Icon(Icons.manage_accounts_outlined, size: 18),
+      label: const Text('Staff Accounts'),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: AppTheme.accent,
+        side: const BorderSide(color: AppTheme.accent),
+        padding: const EdgeInsets.symmetric(vertical: 12),
+      ),
+    );
+    final students = OutlinedButton.icon(
+      onPressed: () => _openThenReload(const AdminStudentsScreen()),
+      icon: const Icon(Icons.people_alt_outlined, size: 18),
+      label: const Text('Students'),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: AppTheme.primary,
+        side: const BorderSide(color: AppTheme.primary),
+        padding: const EdgeInsets.symmetric(vertical: 12),
+      ),
+    );
     return Scaffold(
       body: RefreshIndicator(
         onRefresh: _load,
@@ -512,250 +708,90 @@ class _AdminHomeState extends State<_AdminHome> {
                         ),
 
                       // ── Live Stats ──
-                      IntrinsicHeight(
-                        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                          Expanded(child: _AdminStatCard(
-                              label: 'Pending Requests',
-                              value: '${_stats['pending_requests'] ?? 0}',
-                              icon: Icons.pending_actions_rounded,
-                              color: AppTheme.accent)),
-                          const SizedBox(width: 12),
-                          Expanded(child: _AdminStatCard(
-                              label: 'Active Loans',
-                              value: '${_stats['active_loans'] ?? 0}',
-                              icon: Icons.inventory_2_rounded,
-                              color: AppTheme.success)),
-                        ]),
-                      ),
-                      const SizedBox(height: 12),
-                      IntrinsicHeight(
-                        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                          Expanded(child: _AdminStatCard(
-                              label: 'Overdue Items',
-                              value: '${_stats['overdue_loans'] ?? 0}',
-                              icon: Icons.warning_amber_rounded,
-                              color: AppTheme.danger)),
-                          const SizedBox(width: 12),
-                          Expanded(child: _AdminStatCard(
-                              label: 'Total Equipment',
-                              value: '${_stats['total_equipment'] ?? 0}',
-                              icon: Icons.science_rounded,
-                              color: AppTheme.primary)),
-                        ]),
-                      ),
-                      const SizedBox(height: 12),
-                      IntrinsicHeight(
-                        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                          Expanded(child: _AdminStatCard(
-                              label: 'Registered Students',
-                              value: '${_stats['total_students'] ?? 0}',
-                              icon: Icons.people_alt_rounded,
-                              color: AppTheme.primary)),
-                          const SizedBox(width: 12),
-                          Expanded(child: _AdminStatCard(
-                              label: 'Students on Hold',
-                              value: '${_stats['held_students'] ?? 0}',
-                              icon: Icons.gpp_bad_rounded,
-                              color: AppTheme.danger)),
-                        ]),
-                      ),
+                      for (var i = 0; i < stats.length; i += statsPerRow) ...[
+                        if (i > 0) const SizedBox(height: 12),
+                        IntrinsicHeight(
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                            for (var j = i; j < i + statsPerRow; j++) ...[
+                              if (j > i) const SizedBox(width: 12),
+                              Expanded(child: stats[j]),
+                            ],
+                          ]),
+                        ),
+                      ],
                       const SizedBox(height: 24),
 
-                      // ── Scan QR for Return (manage rights only) ──
-                      if (Session.canManage) ...[
-                        SizedBox(
-                          width: double.infinity,
-                          child: ElevatedButton.icon(
-                            onPressed: () =>
-                                _openThenReload(const QRScanScreen()),
-                            icon: const Icon(Icons.qr_code_scanner_rounded),
-                            label: const Text('Scan QR to Process Return'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: AppTheme.primary,
-                              padding: const EdgeInsets.symmetric(vertical: 14),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-                      // ── Damage reports + penalties quick access (all staff) ──
-                      Row(children: [
-                        Expanded(child: OutlinedButton.icon(
-                          onPressed: () =>
-                              _openThenReload(const AdminDamageReportsScreen()),
-                          icon: const Icon(Icons.report_problem_outlined, size: 18),
-                          label: Text('Damage (${_stats['damage_reports'] ?? 0})'),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: AppTheme.warning,
-                            side: const BorderSide(color: AppTheme.warning),
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                          ),
-                        )),
-                        const SizedBox(width: 12),
-                        Expanded(child: OutlinedButton.icon(
-                          onPressed: () =>
-                              _openThenReload(const AdminPenaltiesScreen()),
-                          icon: const Icon(Icons.gpp_maybe_outlined, size: 18),
-                          label: const Text('Penalties'),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: AppTheme.danger,
-                            side: const BorderSide(color: AppTheme.danger),
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                          ),
-                        )),
-                      ]),
-                      const SizedBox(height: 12),
-                      // ── Staff accounts (super admin only) ──
-                      // The rules refuse this to everyone else, so hiding it is
-                      // a courtesy, not the control.
-                      if (Session.isSuper) ...[
-                        SizedBox(
-                          width: double.infinity,
-                          child: OutlinedButton.icon(
-                            onPressed: () =>
-                                _openThenReload(const AdminStaffAccountsScreen()),
-                            icon: const Icon(Icons.manage_accounts_outlined, size: 18),
-                            label: const Text('Staff Accounts'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: AppTheme.accent,
-                              side: const BorderSide(color: AppTheme.accent),
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-                      // ── Students directory (all staff; viewer is read-only) ──
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton.icon(
-                          onPressed: () =>
-                              _openThenReload(const AdminStudentsScreen()),
-                          icon: const Icon(Icons.people_alt_outlined, size: 18),
-                          label: const Text('Students'),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: AppTheme.primary,
-                            side: const BorderSide(color: AppTheme.primary),
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-
-                      // ── Pending Approvals ──
-                      SectionHeader(
-                          title: 'Pending Approvals (${ApiService.groupRequests(_pending).length})',
-                          action: 'View all',
-                          onAction: () {}),
-                      const SizedBox(height: 12),
-                      if (_pending.isEmpty)
-                        Container(
-                          padding: const EdgeInsets.all(20),
-                          decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(16)),
-                          child: const Center(
-                            child: Column(children: [
-                              Icon(Icons.check_circle_outline_rounded,
-                                  color: AppTheme.success, size: 36),
-                              SizedBox(height: 8),
-                              Text('No pending requests',
-                                  style: TextStyle(color: AppTheme.textMid, fontSize: 13)),
-                            ]),
+                      // ── Quick actions: one row on a wide window ──
+                      if (width >= 900)
+                        IntrinsicHeight(
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              if (Session.canManage) ...[
+                                Expanded(child: processReturn),
+                                const SizedBox(width: 12),
+                              ],
+                              Expanded(child: damage),
+                              const SizedBox(width: 12),
+                              Expanded(child: penalties),
+                              if (Session.isSuper) ...[
+                                const SizedBox(width: 12),
+                                Expanded(child: staffAccounts),
+                              ],
+                              const SizedBox(width: 12),
+                              Expanded(child: students),
+                            ],
                           ),
                         )
-                      else
-                        // One card per request, however many units it holds.
-                        for (final request in ApiService.groupRequests(_pending))
-                          PendingRequestCard(
-                            request: request,
-                            onApprove: () => _approve(request),
-                            onReject: () => _reject(request),
-                          ),
+                      else ...[
+                        // ── Scan QR for Return (manage rights only) ──
+                        if (Session.canManage) ...[
+                          SizedBox(width: double.infinity, child: processReturn),
+                          const SizedBox(height: 12),
+                        ],
+                        // ── Damage reports + penalties quick access (all staff) ──
+                        Row(children: [
+                          Expanded(child: damage),
+                          const SizedBox(width: 12),
+                          Expanded(child: penalties),
+                        ]),
+                        const SizedBox(height: 12),
+                        // ── Staff accounts (super admin only) ──
+                        // The rules refuse this to everyone else, so hiding it
+                        // is a courtesy, not the control.
+                        if (Session.isSuper) ...[
+                          SizedBox(width: double.infinity, child: staffAccounts),
+                          const SizedBox(height: 12),
+                        ],
+                        // ── Students directory (all staff; viewer is read-only) ──
+                        SizedBox(width: double.infinity, child: students),
+                      ],
                       const SizedBox(height: 24),
 
-                      // ── Active Loans (Approved — awaiting return) ──
-                      SectionHeader(
-                          title: 'Active Loans (${_approved.length})',
-                          action: 'View all',
-                          onAction: () {}),
-                      const SizedBox(height: 12),
-                      if (_approved.isEmpty)
-                        Container(
-                          padding: const EdgeInsets.all(20),
-                          decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(16)),
-                          child: const Center(
-                            child: Text('No active loans',
-                                style: TextStyle(color: AppTheme.textMid, fontSize: 13)),
-                          ),
-                        )
-                      else
-                        ..._approved.map((e) {
-                          // Always a String, whatever the record holds (QA 2026-10-03).
-                          final name = '${e['borrower_name'] ?? e['student_number'] ?? 'Student'}';
-                          final equipName = e['equipment_name'] ?? 'Equipment';
-                          final dueDate = (e['due_date'] ?? '').toString().split('T').first;
-                          // Every active loan was badged a green "Active",
-                          // including ones already past due, so the Dashboard
-                          // gave staff no way to see which (QA 2026-09-19,
-                          // low #8). The stored status is unchanged.
-                          final due = ApiService.asDate(e['due_date']);
-                          final isOverdue =
-                              due != null && due.isBefore(DateTime.now());
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: Container(
-                              padding: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                  color: Colors.white,
-                                  borderRadius: BorderRadius.circular(16),
-                                  border: Border.all(color: const Color(0x3306D6A0))),
-                              child: Column(children: [
-                                Row(children: [
-                                  Container(
-                                    width: 40, height: 40,
-                                    decoration: BoxDecoration(
-                                        color: const Color(0x1A06D6A0),
-                                        borderRadius: BorderRadius.circular(10)),
-                                    child: const Icon(Icons.science_outlined,
-                                        color: AppTheme.success, size: 20),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                    Text(equipName, style: const TextStyle(
-                                        fontWeight: FontWeight.bold, fontSize: 13,
-                                        color: AppTheme.textDark)),
-                                    Text('$name  •  Due: $dueDate',
-                                        style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
-                                  ])),
-                                  StatusBadge(
-                                      label: isOverdue ? 'Overdue' : 'Active',
-                                      color: isOverdue
-                                          ? AppTheme.danger
-                                          : AppTheme.success),
-                                ]),
-                                if (Session.canManage) ...[
-                                  const SizedBox(height: 12),
-                                  const Divider(color: AppTheme.divider, height: 1),
-                                  const SizedBox(height: 10),
-                                  SizedBox(
-                                    width: double.infinity,
-                                    child: ElevatedButton.icon(
-                                      onPressed: () => _return(e),
-                                      icon: const Icon(Icons.assignment_return_rounded, size: 16),
-                                      label: const Text('Mark as Returned'),
-                                      style: ElevatedButton.styleFrom(
-                                          backgroundColor: AppTheme.primary),
-                                    ),
-                                  ),
-                                ],
-                              ]),
+                      // ── Pending Approvals and Active Loans ──
+                      // Side by side on a full-size monitor.
+                      if (width >= 1200)
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: _pendingSection()),
                             ),
-                          );
-                        }),
+                            const SizedBox(width: 20),
+                            Expanded(
+                              child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: _activeSection()),
+                            ),
+                          ],
+                        )
+                      else ...[
+                        ..._pendingSection(),
+                        const SizedBox(height: 24),
+                        ..._activeSection(),
+                      ],
                       const SizedBox(height: 20),
                     ],
                   ),

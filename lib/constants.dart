@@ -16,8 +16,8 @@
 // `version: <kAppVersion>+<kAppBuild>` in step. Dart cannot read pubspec at
 // runtime without adding the package_info_plus plugin, which is not worth a new
 // native dependency this close to the defense.
-const kAppVersion = '1.0.14';
-const kAppBuild = 15;
+const kAppVersion = '1.0.20';
+const kAppBuild = 35;
 
 // What the About screen prints, e.g. "Version 1.0.1 (build 2)".
 const kAppVersionLabel = 'Version $kAppVersion (build $kAppBuild)';
@@ -65,6 +65,17 @@ const kMaxUnitsPerRegistration = 200;
 // each record (the student's profile and the unit); a batch may make at most
 // 20 such reads, so 8 leaves room.
 const kMaxUnitsPerRequest = 8;
+
+// Borrowing hours (the lab's rule, 2026-10-19; was a 5:00 PM cap): requests
+// from 7:00 AM, and everything back the same day by 10:00 PM at the latest.
+const kBorrowOpenHour = 7;
+const kReturnByHour = 22;
+
+// The statuses of a request that is still open: waiting for staff, or approved
+// (set aside for pick-up or out on loan). The checks before a new request (an
+// overdue loan, a duplicate pending request) need only these, so they read
+// these instead of the student's whole history (1.0.19).
+const kOpenRequestStatuses = ['Pending', 'Approved'];
 
 // ─── Staff access levels ──────────────────────────────────────────────────────
 // Mirrors the roles firestore.rules knows about. 'superadmin' was added on
@@ -114,3 +125,13 @@ const _kMonthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
 // "6/May/92", and an all-number form would be ambiguous between 5/6 and 6/5.
 String formatDate(DateTime d) =>
     '${_kMonthNames[d.month - 1]} ${d.day}, ${d.year}';
+
+// ─── Text ─────────────────────────────────────────────────────────────────────
+// "Beaker 1000 mL #1  •  OTH-137911": the parts that are not empty, with the
+// separator only between them. An item without a QR code (the Digital
+// Multimeter) used to read "Digital Multimeter  •" or "·  Electronics"
+// (live test 2026-10-07).
+String joinParts(Iterable<Object?> parts, {String separator = '  •  '}) => parts
+    .map((p) => '${p ?? ''}'.trim())
+    .where((p) => p.isNotEmpty)
+    .join(separator);

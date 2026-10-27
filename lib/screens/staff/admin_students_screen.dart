@@ -106,12 +106,17 @@ class _AdminStudentsScreenState extends State<AdminStudentsScreen> {
                                 : 'No students match "$_query".',
                             style: const TextStyle(color: AppTheme.textMid))),
                         ])
-                      : ListView.separated(
-                          padding: const EdgeInsets.all(16),
-                          itemCount: _filtered.length,
-                          separatorBuilder: (_, _) => const SizedBox(height: 10),
-                          itemBuilder: (_, i) => _studentTile(_filtered[i]),
-                        ),
+                      : LayoutBuilder(builder: (context, box) {
+                          // Rows of tiles on a wide window, one per row on a phone.
+                          final cols = gridColumns(box.maxWidth - 32, minWidth: 360);
+                          return ListView.separated(
+                            padding: const EdgeInsets.all(16),
+                            itemCount: (_filtered.length + cols - 1) ~/ cols,
+                            separatorBuilder: (_, _) => const SizedBox(height: 10),
+                            itemBuilder: (_, row) => gridRow(row, cols, _filtered.length,
+                                (i) => _studentTile(_filtered[i])),
+                          );
+                        }),
                 ),
         ),
       ]),

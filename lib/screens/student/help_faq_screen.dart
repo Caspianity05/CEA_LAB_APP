@@ -24,19 +24,19 @@ class _HelpFaqScreenState extends State<HelpFaqScreen> {
   final _faqs = const [
     {
       'q': 'How do I borrow equipment?',
-      'a': 'Go to the Equipment Catalog, tap on the item you want to borrow, fill in the Borrow Request form, and submit. Your request will be reviewed by lab staff.',
+      'a': 'On Home, tap New Request (or open an item in the Equipment Catalog and tap Borrow This Equipment). Choose the items and how many of each, then submit. The items are reserved for you while lab staff review the request; once it is approved, pick them up at the laboratory. Profile → How Borrowing Works shows every step.',
     },
     {
       'q': 'How long can I borrow equipment?',
-      'a': 'Borrowing is same-day only. Equipment must be returned by 5:00 PM on the day it is borrowed, and the return time is fixed when you submit your request.',
+      'a': 'Borrowing is same-day only. You can borrow from 7:00 AM. You choose the return time when you send the request, at the latest 10:00 PM on the day you borrow. Lab staff can give you a later time; My Loans always shows the time that applies.',
     },
     {
       'q': 'What happens if I return equipment late?',
-      'a': 'Late returns are recorded in your profile. Repeated late returns may affect your borrowing privileges. Always return equipment on or before the due date.',
+      'a': 'Late returns are recorded in your profile, and while an item is overdue you cannot send a new request. Repeated late returns may affect your borrowing privileges. Always return equipment on or before its due time.',
     },
     {
       'q': 'Where do I find the equipment QR code?',
-      'a': 'Open the item from the Equipment Catalog — its QR code is shown on the Equipment Detail screen. You do not scan anything yourself to borrow: lab staff scan the code on the item when they process your return.',
+      'a': 'It is on a label stuck to the item itself. You do not scan anything yourself: lab staff scan the label on each item when they hand it to you and again when you return it. My Loans shows the code of each item you have on loan.',
     },
     {
       'q': 'What do I do if equipment is damaged?',
@@ -44,7 +44,7 @@ class _HelpFaqScreenState extends State<HelpFaqScreen> {
     },
     {
       'q': 'Can I cancel a borrow request?',
-      'a': 'You can cancel a pending request by contacting the lab staff directly. Once approved, cancellations must also be done in person at the laboratory.',
+      'a': 'Yes, while it is still pending: open My Loans → Pending and tap Cancel request. The items go back to the lab at once. Once a request is approved, ask the lab staff instead.',
     },
     {
       'q': 'I forgot my password, what should I do?',

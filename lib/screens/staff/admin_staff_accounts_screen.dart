@@ -257,7 +257,7 @@ class _AdminStaffAccountsScreenState extends State<AdminStaffAccountsScreen> {
               : RefreshIndicator(
                   onRefresh: _load,
                   child: ListView(
-                    padding: const EdgeInsets.all(20),
+                    padding: readablePadding(context, const EdgeInsets.all(20), maxWidth: 900),
                     children: [
                       const SectionDivider(
                           icon: Icons.manage_accounts_rounded,

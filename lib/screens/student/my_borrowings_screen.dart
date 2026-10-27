@@ -50,7 +50,15 @@ class _MyBorrowingsScreenState extends State<MyBorrowingsScreen> {
         final all = snap.data ?? const [];
         final active  = all.where((e) => e['status'] == 'Approved').toList();
         final pending = all.where((e) => e['status'] == 'Pending').toList();
-        final history = all.where((e) => e['status'] == 'Returned' || e['status'] == 'Rejected').toList();
+        final history = all.where((e) =>
+            e['status'] == 'Returned' || e['status'] == 'Rejected' ||
+            e['status'] == 'Cancelled').toList();
+        // Requests with something already returned: their Active card asks for
+        // the rest back instead of "Pick it up".
+        final partlyBack = {
+          for (final e in all)
+            if (e['status'] == 'Returned') ApiService.requestKey(e),
+        };
 
         return DefaultTabController(
           length: 3,
@@ -66,9 +74,14 @@ class _MyBorrowingsScreenState extends State<MyBorrowingsScreen> {
             ),
             body: TabBarView(
               children: [
-                _RequestList(items: active),
+                // Waiting at the lab and handed over are separate cards
+                // (2026-10-06).
+                _RequestList(items: active, partlyBack: partlyBack, byPickup: true),
                 _RequestList(items: pending),
-                _RequestList(items: history),
+                // Split by status too: a request can end partly returned and
+                // partly rejected, and one card for both read "Returned" for
+                // items that were never lent (QA 2026-10-06).
+                _RequestList(items: history, byStatus: true),
               ],
             ),
           ),
@@ -80,7 +93,12 @@ class _MyBorrowingsScreenState extends State<MyBorrowingsScreen> {
 
 class _RequestList extends StatelessWidget {
   final List<dynamic> items;
-  const _RequestList({required this.items});
+  final bool byStatus;
+  final bool byPickup;
+  final Set<String> partlyBack;
+  const _RequestList(
+      {required this.items, this.byStatus = false, this.byPickup = false,
+      this.partlyBack = const {}});
 
   @override
   Widget build(BuildContext context) {
@@ -97,14 +115,17 @@ class _RequestList extends StatelessWidget {
         ]),
       ]));
     }
-    final requests = ApiService.groupRequests(items);
+    final requests =
+        ApiService.groupRequests(items, byStatus: byStatus, byPickup: byPickup);
     return Material(
       color: Colors.transparent,
       child: ListView.separated(
         padding: const EdgeInsets.all(16),
         itemCount: requests.length,
         separatorBuilder: (_, _) => const SizedBox(height: 10),
-        itemBuilder: (_, i) => _RequestCard(request: requests[i]),
+        itemBuilder: (_, i) => _RequestCard(
+            request: requests[i],
+            partlyBack: partlyBack.contains(ApiService.requestKey(requests[i].first))),
       ),
     );
   }
@@ -113,7 +134,71 @@ class _RequestList extends StatelessWidget {
 // One request: its items, its status, and what the student should do next.
 class _RequestCard extends StatelessWidget {
   final List<dynamic> request;
-  const _RequestCard({required this.request});
+  // Some of this request is already back (Active tab only).
+  final bool partlyBack;
+  const _RequestCard({required this.request, this.partlyBack = false});
+
+  Future<void> _confirmCancel(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cancel this request?'),
+        content: Text(
+            'You asked for ${ApiService.requestSummary(request)}. Cancelling '
+            'gives the items back to the lab, and staff will not see the '
+            'request any more.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep it')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Cancel request',
+                  style: TextStyle(color: AppTheme.danger))),
+        ],
+      ),
+    );
+    if (ok != true || !context.mounted) return;
+    final res = await ApiService.cancelRequest(request);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('${res['message']}'),
+      backgroundColor: res['success'] == true ? AppTheme.success : AppTheme.danger,
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  // The records grouped by item type, alphabetically.
+  static List<List<dynamic>> _byType(List<dynamic> records) {
+    final types = <String, List<dynamic>>{};
+    for (final t in records) {
+      types.putIfAbsent(ApiService.baseNameOf('${t['equipment_name'] ?? ''}'), () => []).add(t);
+    }
+    final names = types.keys.toList()..sort();
+    return [for (final n in names) types[n]!];
+  }
+
+  Widget _itemRow(dynamic e, String title, String? code) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Row(children: [
+          EquipmentThumb(
+            bytes: photoThumbOf(e),
+            category: e['category'] as String? ?? '',
+            color: AppTheme.primary,
+            size: 40,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(title,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
+              if (code != null && code.isNotEmpty)
+                Text(code,
+                    style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
+            ]),
+          ),
+        ]),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -122,7 +207,10 @@ class _RequestCard extends StatelessWidget {
     final now     = DateTime.now();
     final due     = ApiService.asDate(first['due_date']);
     final asked   = ApiService.asDate(first['borrow_date']);
-    final overdue = status == 'Approved' && due != null && due.isBefore(now);
+    // Approved items wait at the lab until staff hand them over; only items
+    // the student has can be overdue (2026-10-06).
+    final ready   = request.any(ApiService.awaitingPickup);
+    final overdue = request.any(ApiService.isOverdue);
     String time(DateTime d) => TimeOfDay.fromDateTime(d).format(context);
     String when(DateTime d) {
       final today = d.year == now.year && d.month == now.month && d.day == now.day;
@@ -130,25 +218,39 @@ class _RequestCard extends StatelessWidget {
     }
 
     final (label, color) = switch (status) {
+      'Approved' when ready => ('Ready for pick-up', AppTheme.primary),
       'Approved' when overdue => ('Overdue', AppTheme.danger),
-      'Approved' => ('Approved', AppTheme.success),
+      'Approved' => ('On loan', AppTheme.success),
       'Pending'  => ('Pending', AppTheme.accent),
       'Returned' => ('Returned', AppTheme.textMid),
       'Rejected' => ('Rejected', AppTheme.danger),
+      'Cancelled' => ('Cancelled', AppTheme.textMid),
       _          => (status, AppTheme.textMid),
     };
 
     // What happens next, in plain words.
     final reason = '${first['reject_reason'] ?? ''}'.trim();
+    final cancelReason = '${first['cancel_reason'] ?? ''}'.trim();
     final (IconData nextIcon, String next) = switch (status) {
       'Pending' => (Icons.hourglass_top_rounded,
-          'Waiting for staff approval. This page updates by itself when they decide.'),
+          'Waiting for staff approval. The items are reserved for you meanwhile, '
+              'and this page updates by itself when staff decide.'),
+      'Cancelled' => (Icons.do_not_disturb_on_outlined,
+          cancelReason.isEmpty
+              ? 'You cancelled this request.'
+              : 'Cancelled by staff: $cancelReason'),
+      'Approved' when ready => (Icons.storefront_outlined,
+          'Approved. Pick it up at the lab: staff scan each item as they hand '
+              'it to you. Return it by ${due == null ? '10:00 PM today' : when(due)}.'),
       'Approved' when overdue => (Icons.warning_amber_rounded,
-          'Overdue: it was due back by ${when(due)}. Return it to '
+          'Overdue: it was due back by ${due == null ? 'its due time' : when(due)}. Return it to '
               'the lab as soon as possible. You cannot borrow anything else until you do.'),
+      'Approved' when partlyBack => (Icons.check_circle_outline_rounded,
+          'Part of this request is back. Return the rest by '
+              '${due == null ? '10:00 PM today' : when(due)}.'),
       'Approved' => (Icons.check_circle_outline_rounded,
-          'Approved. Pick it up at the lab, and return it by '
-              '${due == null ? '5:00 PM today' : when(due)}.'),
+          'You have it. Return it to the lab by '
+              '${due == null ? '10:00 PM today' : when(due)}.'),
       'Rejected' => (Icons.cancel_outlined,
           reason.isEmpty ? 'Rejected by staff.' : 'Rejected by staff: $reason'),
       'Returned' => (Icons.assignment_turned_in_outlined, 'Returned. Thank you!'),
@@ -169,27 +271,22 @@ class _RequestCard extends StatelessWidget {
           StatusBadge(label: label, color: color),
         ]),
         const SizedBox(height: 10),
-        for (final e in request)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Row(children: [
-              EquipmentThumb(
-                bytes: photoThumbOf(e),
-                category: e['category'] as String? ?? '',
-                color: AppTheme.primary,
-                size: 40,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('${e['equipment_name'] ?? ''}',
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textDark)),
-                  Text('${e['qr_code'] ?? ''}',
-                      style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
-                ]),
-              ),
-            ]),
-          ),
+        // Lent units by name and code. A pending or rejected request has no
+        // unit of its own yet: the one it reserved can change at approval, and
+        // showing it put "Depth Gauge #2" on a student's Pending card while the
+        // same unit was on their Active one (QA 2026-10-06). So those list the
+        // item types they asked for. So does one waiting for pick-up: staff
+        // may hand over another unit of the same item (2026-10-06).
+        if (status == 'Pending' || status == 'Rejected' || status == 'Cancelled' || ready)
+          for (final type in _byType(request))
+            _itemRow(type.first,
+                type.length > 1
+                    ? '${ApiService.baseNameOf('${type.first['equipment_name'] ?? ''}')} × ${type.length}'
+                    : ApiService.baseNameOf('${type.first['equipment_name'] ?? ''}'),
+                null)
+        else
+          for (final e in request)
+            _itemRow(e, '${e['equipment_name'] ?? ''}', '${e['qr_code'] ?? ''}'),
 
         // Next step.
         Container(
@@ -206,7 +303,24 @@ class _RequestCard extends StatelessWidget {
           ]),
         ),
 
-        if (status == 'Approved') ...[
+        // Changed your mind? A request can be taken back until staff decide
+        // (2026-10-06); it used to need staff to reject it.
+        if (status == 'Pending') ...[
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _confirmCancel(context),
+              icon: const Icon(Icons.close_rounded, size: 16),
+              label: const Text('Cancel request'),
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: AppTheme.textMid,
+                  side: const BorderSide(color: AppTheme.divider)),
+            ),
+          ),
+        ],
+
+        if (status == 'Approved' && !ready) ...[
           const SizedBox(height: 8),
           const Row(children: [
             Icon(Icons.qr_code_2_rounded, size: 13, color: AppTheme.textLight),

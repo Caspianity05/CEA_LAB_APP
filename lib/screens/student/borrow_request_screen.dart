@@ -12,6 +12,12 @@
 //     when the request is sent), it only made the form longer;
 //   • name and student ID are one read-only line instead of two locked fields;
 //   • subject and purpose stay optional.
+// 1.0.20 (2026-10-19, the lab's rules): Subject and Where (where the items
+// will be used) are required so staff can trace every borrower; the student
+// must choose the return time; requests from 7:00 AM, back by 10:00 PM.
+// 1.0.19 (2026-10-15): the item list comes from the item-type list and a
+// type's free units are counted only when it is picked (Firestore reads, see
+// ApiService "Item types").
 // -----------------------------------------------------------------------------
 
 import 'dart:typed_data';
@@ -26,9 +32,14 @@ import '../../widgets/common.dart';
 import 'lab_policies_screen.dart';
 
 // ─── Item Type Picker Sheet ───────────────────────────────────────────────────
-// Bottom sheet behind "Add equipment": every item type with at least one
-// Available unit, how many are free, and a search box. Pops with the chosen
-// type ({name, category, count, photo_thumb}).
+// Bottom sheet behind "Add equipment": the item types in the lab and a search
+// box. Pops with the chosen type ({name, category, count, photo_thumb}), where
+// count is how many are free right now.
+//
+// Since 1.0.19 the list is the item-type list (one read, kept for a few
+// minutes) and a type's free units are counted when the student taps it (one
+// read). The sheet used to read every Available unit each time it opened:
+// ~945 reads with the full inventory (2026-10-15).
 
 class _TypePickerSheet extends StatefulWidget {
   final Set<String> alreadyAdded;
@@ -39,19 +50,54 @@ class _TypePickerSheet extends StatefulWidget {
 
 class _TypePickerSheetState extends State<_TypePickerSheet> {
   List<Map<String, dynamic>> _types = [];
+  // Until staff build the type list, the old list is used; it already knows
+  // how many of each are free.
+  bool _counted = false;
   bool _loading = true;
   bool _failed  = false;
   final _searchCtrl = TextEditingController();
   String _search = '';
+  // The type being checked after a tap, and what a check found when nothing
+  // could be added.
+  String _checking = '';
+  final Map<String, String> _note = {};
 
   @override
   void initState() {
     super.initState();
-    ApiService.getAvailableTypes().then((types) {
-      if (mounted) setState(() { _types = types; _loading = false; });
+    ApiService.getBorrowableTypes().then((res) {
+      if (mounted) {
+        setState(() { _types = res.types; _counted = res.counted; _loading = false; });
+      }
     }).catchError((_) {
       if (mounted) setState(() { _failed = true; _loading = false; });
     });
+  }
+
+  Future<void> _pick(Map<String, dynamic> t) async {
+    if (_checking.isNotEmpty) return;
+    if (_counted) {
+      Navigator.pop(context, {...t, 'count': t['available']});
+      return;
+    }
+    final name = '${t['name']}';
+    setState(() { _checking = name; _note.remove(name); });
+    try {
+      final free = await ApiService.availableNow(name);
+      if (!mounted) return;
+      if (free > 0) {
+        Navigator.pop(context, {...t, 'count': free});
+        return;
+      }
+      final inLab = t['in_service'] as int? ?? 0;
+      setState(() => _note[name] = inLab == 1
+          ? 'None free right now: it is out or reserved.'
+          : 'None free right now: all $inLab are out or reserved.');
+    } catch (_) {
+      if (mounted) setState(() => _note[name] = 'Could not check. Tap to try again.');
+    } finally {
+      if (mounted) setState(() => _checking = '');
+    }
   }
 
   @override
@@ -93,10 +139,13 @@ class _TypePickerSheetState extends State<_TypePickerSheet> {
           ]),
         ),
         const SizedBox(height: 4),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 20),
-          child: Text('Only items available right now are shown.',
-              style: TextStyle(fontSize: 12, color: AppTheme.textMid)),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Text(
+              _counted
+                  ? 'Only items available right now are shown.'
+                  : 'Tap an item to add it. The app checks how many are free.',
+              style: const TextStyle(fontSize: 12, color: AppTheme.textMid)),
         ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
@@ -118,19 +167,27 @@ class _TypePickerSheetState extends State<_TypePickerSheet> {
                       child: Text('Could not load equipment.',
                           style: TextStyle(color: AppTheme.textMid)))
                   : shown.isEmpty
-                      ? const Center(
-                          child: Text('No available equipment.',
-                              style: TextStyle(color: AppTheme.textMid)))
+                      ? Center(
+                          child: Text(
+                              _types.isEmpty
+                                  ? 'No available equipment.'
+                                  : 'No equipment matches "$_search".',
+                              style: const TextStyle(color: AppTheme.textMid)))
                       : ListView.separated(
                           padding: const EdgeInsets.all(16),
                           itemCount: shown.length,
                           separatorBuilder: (_, _) => const SizedBox(height: 8),
                           itemBuilder: (_, i) {
                             final t = shown[i];
-                            final added = widget.alreadyAdded.contains('${t['name']}');
-                            final count = t['count'] as int? ?? 0;
+                            final name = '${t['name']}';
+                            final added = widget.alreadyAdded.contains(name);
+                            final checking = _checking == name;
+                            final note = _note[name];
+                            final line = _counted
+                                ? '${t['available'] ?? 0} available  •  ${t['category'] ?? ''}'
+                                : '${t['in_service'] ?? 0} in the lab  •  ${t['category'] ?? ''}';
                             return GestureDetector(
-                              onTap: () => Navigator.pop(context, t),
+                              onTap: () => _pick(t),
                               child: Container(
                                 padding: const EdgeInsets.all(14),
                                 decoration: BoxDecoration(
@@ -155,16 +212,24 @@ class _TypePickerSheetState extends State<_TypePickerSheet> {
                                             fontWeight: FontWeight.bold,
                                             fontSize: 14,
                                             color: AppTheme.textDark)),
-                                    Text('$count available  •  ${t['category'] ?? ''}',
-                                        style: const TextStyle(
-                                            fontSize: 12, color: AppTheme.textMid)),
+                                    Text(note ?? line,
+                                        style: TextStyle(
+                                            fontSize: 12,
+                                            color: note == null
+                                                ? AppTheme.textMid
+                                                : AppTheme.danger)),
                                   ])),
-                                  Icon(
-                                    added
-                                        ? Icons.check_circle_rounded
-                                        : Icons.add_circle_outline_rounded,
-                                    color: added ? AppTheme.primary : AppTheme.success,
-                                  ),
+                                  if (checking)
+                                    const SizedBox(
+                                        width: 22, height: 22,
+                                        child: CircularProgressIndicator(strokeWidth: 2))
+                                  else
+                                    Icon(
+                                      added
+                                          ? Icons.check_circle_rounded
+                                          : Icons.add_circle_outline_rounded,
+                                      color: added ? AppTheme.primary : AppTheme.success,
+                                    ),
                                 ]),
                               ),
                             );
@@ -203,11 +268,15 @@ class BorrowRequestScreen extends StatefulWidget {
   // Full equipment record when the student arrives from the catalog, so its
   // type can be added to the request straight away, with its photo.
   final Map<String, dynamic>? equipment;
+  // How many of that type are free, when the item page has just counted them
+  // (1.0.19), so the form does not count again.
+  final int? available;
   const BorrowRequestScreen({
     super.key,
     this.equipmentName,
     this.equipmentId = '',
     this.equipment,
+    this.available,
   });
   @override
   State<BorrowRequestScreen> createState() => _BorrowRequestScreenState();
@@ -217,11 +286,12 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
   bool _loading = false;
   bool _agreedToPolicies = false;
   final _subjectCtrl = TextEditingController();
+  final _whereCtrl = TextEditingController();
   final _purposeCtrl = TextEditingController();
   final List<_Line> _lines = [];
 
-  // Return time — default 5:00 PM, the latest the lab allows.
-  TimeOfDay _returnTime = const TimeOfDay(hour: 17, minute: 0);
+  // Return time: none until the student chooses one (required, 1.0.20).
+  TimeOfDay? _returnTime;
 
   int get _total => _lines.fold(0, (n, l) => n + l.qty);
 
@@ -245,13 +315,12 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
   Future<void> _pickReturnTime() async {
     final picked = await showTimePicker(
       context: context,
-      initialTime: _returnTime,
+      initialTime: _returnTime ?? TimeOfDay.now(),
       helpText: 'Return by',
     );
     if (picked == null) return;
-    if (picked.hour > 17 || (picked.hour == 17 && picked.minute > 0)) {
-      setState(() => _returnTime = const TimeOfDay(hour: 17, minute: 0));
-      _warn('Return time cannot be later than 5:00 PM.');
+    if (_minutes(picked) > kReturnByHour * 60) {
+      _warn('Return time cannot be later than 10:00 PM.');
     } else if (_minutes(picked) <= _minutes(TimeOfDay.now())) {
       // A return time already gone by makes the loan overdue the moment staff
       // approve it (QA 2026-09-19, M3). Refuse it instead of storing it.
@@ -273,6 +342,19 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
   @override
   void initState() {
     super.initState();
+    // A student on hold only found out on Submit, after filling the whole
+    // form (QA 2026-10-06). Re-read the hold, as Home does, and say it up
+    // front. Submit still asks the server, which has the last word.
+    final sid = Session.currentUser?['student_id']?.toString() ?? '';
+    if (sid.isNotEmpty) {
+      ApiService.getStudent(sid).then((fresh) {
+        if (!mounted || fresh == null || Session.currentUser == null) return;
+        setState(() {
+          Session.currentUser!['hold'] = fresh['hold'] ?? false;
+          Session.currentUser!['hold_reason'] = fresh['hold_reason'] ?? '';
+        });
+      }).catchError((_) {});
+    }
     // Arrived from the catalog: start the request with that item's type.
     final e = widget.equipment;
     final rawName = '${e?['equipment_name'] ?? widget.equipmentName ?? ''}';
@@ -286,24 +368,34 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
             : '${e?['equipment_id'] ?? ''}',
       );
       _lines.add(line);
-      // How many of that type are free, for the quantity limit.
-      ApiService.getAvailableTypes().then((types) {
-        if (!mounted) return;
-        final match = types.where((t) => t['name'] == line.name).toList();
-        setState(() => line.available =
-            match.isEmpty ? 0 : (match.first['count'] as int? ?? 0));
-      }).catchError((_) {});
+      // How many of that type are free, for the quantity limit: one count
+      // (1.0.19), or none when the item page has just counted.
+      final known = widget.available;
+      if (known != null) {
+        line.available = known;
+      } else {
+        ApiService.availableNow(line.name).then((n) {
+          if (mounted) setState(() => line.available = n);
+        }).catchError((_) {});
+      }
     }
   }
 
   @override
   void dispose() {
     _subjectCtrl.dispose();
+    _whereCtrl.dispose();
     _purposeCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _addItems() async {
+    // Full already: say so here instead of opening the picker and refusing
+    // the pick afterwards (QA 2026-10-06).
+    if (_total >= kMaxUnitsPerRequest) {
+      _warn('At most $kMaxUnitsPerRequest items per request.');
+      return;
+    }
     final picked = await showModalBottomSheet<Map<String, dynamic>>(
       context: context,
       isScrollControlled: true,
@@ -371,16 +463,29 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
     }
     // A deadline that has already gone by makes the loan overdue the moment
     // staff approve it, so the request is refused here rather than stored
-    // (QA 2026-09-19, M3). Under the same-day 5:00 PM policy that also means
-    // nothing can be borrowed once 5:00 PM has passed.
+    // (QA 2026-09-19, M3). Borrowing hours are 7:00 AM to 10:00 PM, the
+    // latest return time, so nothing can be borrowed outside them.
     final nowTime = TimeOfDay.now();
-    if (_minutes(nowTime) >= 17 * 60) {
-      _warn('Borrowing is closed for today — all equipment is due back by '
-          '5:00 PM. Please file the request tomorrow.');
+    if (nowTime.hour < kBorrowOpenHour) {
+      _warn('Borrowing opens at 7:00 AM. Please send the request then.');
       return;
     }
-    if (_minutes(_returnTime) <= _minutes(nowTime)) {
-      _warn('Return time ${_formatTime(_returnTime)} has already passed. '
+    if (_minutes(nowTime) >= kReturnByHour * 60) {
+      _warn('Borrowing is closed for today — all equipment is due back by '
+          '10:00 PM. Please file the request tomorrow.');
+      return;
+    }
+    if (_subjectCtrl.text.trim().isEmpty || _whereCtrl.text.trim().isEmpty) {
+      _warn('Please fill in the Subject and where you will use the equipment.');
+      return;
+    }
+    final returnTime = _returnTime;
+    if (returnTime == null) {
+      _warn('Please choose your return time.');
+      return;
+    }
+    if (_minutes(returnTime) <= _minutes(nowTime)) {
+      _warn('Return time ${_formatTime(returnTime)} has already passed. '
           'Please choose a later time.');
       return;
     }
@@ -391,7 +496,8 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
         'borrower_name':  Session.name,
         'student_number': Session.studentNumber,
         'subject':        _subjectCtrl.text.trim(),
-        'due_date':       _toDateTime(_returnTime).toIso8601String(),
+        'use_location':   _whereCtrl.text.trim(),
+        'due_date':       _toDateTime(returnTime).toIso8601String(),
         'purpose':        _purposeCtrl.text.trim(),
       }, [
         for (final l in _lines)
@@ -408,7 +514,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
             content: Text('You asked for ${res['summary'] ?? 'your equipment'}.\n\n'
                 'Next: wait for staff to approve it (see My Loans). Once '
                 'approved, pick it up at the lab and return it by '
-                '${_formatTime(_returnTime)} today.',
+                '${_formatTime(returnTime)} today.',
                 textAlign: TextAlign.center),
             actions: [ElevatedButton(
               onPressed: () { Navigator.pop(context); Navigator.pop(context); },
@@ -502,6 +608,30 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (Session.isOnHold)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                margin: const EdgeInsets.only(bottom: 16),
+                decoration: BoxDecoration(
+                  color: const Color(0x1AE74C3C),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.danger.withValues(alpha: 0.4)),
+                ),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.gpp_bad_rounded, color: AppTheme.danger, size: 22),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Borrowing on hold. You cannot send a request until the '
+                      'laboratory staff lift it.'
+                      '${Session.holdReason.isNotEmpty ? '\n${Session.holdReason}' : ''}',
+                      style: const TextStyle(
+                          fontSize: 12, color: AppTheme.textDark, height: 1.4),
+                    ),
+                  ),
+                ]),
+              ),
             // ── 1. What to borrow ──
             FieldLabel('Equipment'),
             const SizedBox(height: 8),
@@ -560,27 +690,41 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
                   const Icon(Icons.timer_outlined, color: AppTheme.primary, size: 18),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text('${_formatTime(_returnTime)} today',
-                        style: const TextStyle(
+                    child: Text(
+                        _returnTime == null
+                            ? 'Choose a return time'
+                            : '${_formatTime(_returnTime!)} today',
+                        style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.w600,
-                            color: AppTheme.textDark)),
+                            color: _returnTime == null
+                                ? AppTheme.textMid
+                                : AppTheme.textDark)),
                   ),
-                  const Text('Change',
-                      style: TextStyle(fontSize: 12, color: AppTheme.accent)),
+                  Text(_returnTime == null ? 'Choose' : 'Change',
+                      style: const TextStyle(fontSize: 12, color: AppTheme.accent)),
                 ]),
               ),
             ),
             const SizedBox(height: 6),
-            const Text('Everything is returned the same day, by 5:00 PM at the latest.',
+            const Text('Everything is returned the same day, by 10:00 PM at the latest.',
                 style: TextStyle(fontSize: 11, color: AppTheme.textMid)),
             const SizedBox(height: 20),
 
-            // ── 3. Optional details ──
-            FieldLabel('Subject / Section (optional)'),
+            // ── 3. Details: staff trace the borrower by these ──
+            FieldLabel('Subject / Section'),
             const SizedBox(height: 8),
             TextField(controller: _subjectCtrl,
-                decoration: const InputDecoration(hintText: 'e.g. CE 311 - Sec A')),
+                maxLength: 200,
+                decoration: const InputDecoration(
+                    hintText: 'e.g. CE 311 - Sec A', counterText: '')),
+            const SizedBox(height: 16),
+            FieldLabel('Where you will use it'),
+            const SizedBox(height: 8),
+            TextField(controller: _whereCtrl,
+                maxLength: 200,
+                decoration: const InputDecoration(
+                    hintText: 'e.g. Room 301, CE Lab', counterText: '')),
             const SizedBox(height: 16),
             FieldLabel('Purpose (optional)'),
             const SizedBox(height: 8),
@@ -635,7 +779,7 @@ class _BorrowRequestScreenState extends State<BorrowRequestScreen> {
                   _PolicyReminder(
                     icon: Icons.access_time_rounded,
                     color: AppTheme.warning,
-                    text: 'Return before 5:00 PM. Late returns lose borrowing privileges.',
+                    text: 'Return by 10:00 PM. Late returns lose borrowing privileges.',
                   ),
                   const SizedBox(height: 6),
                   _PolicyReminder(

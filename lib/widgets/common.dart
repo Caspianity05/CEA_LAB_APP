@@ -405,3 +405,72 @@ class DateField extends StatelessWidget {
   }
 }
 
+
+// ─── Wide windows (the web staff portal) ──────────────────────────────────────
+// The web build fills the browser window (2026-10-06), so lists of cards lay
+// out in rows of cards there. A phone is too narrow for more than one column
+// and keeps the plain list it always had.
+
+/// How many cards at least [minWidth] wide fit across [width] (1 to [max]).
+int gridColumns(double width, {double minWidth = 440, int max = 4}) {
+  final fit = (width + 12) ~/ (minWidth + 12);
+  return fit < 1 ? 1 : (fit > max ? max : fit);
+}
+
+/// One row of a card grid: [cells] side by side at equal widths, all as tall
+/// as the tallest. A short last row leaves its remaining columns empty.
+class GridRow extends StatelessWidget {
+  final List<Widget> cells;
+  final int columns;
+  const GridRow({super.key, required this.cells, required this.columns});
+
+  @override
+  Widget build(BuildContext context) {
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < columns; i++) ...[
+            if (i > 0) const SizedBox(width: 12),
+            Expanded(child: i < cells.length ? cells[i] : const SizedBox.shrink()),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Row [row] of a lazily built list of [count] cards in [columns]: the cards
+/// from [cardAt] as a [GridRow], or the single card when [columns] is 1.
+Widget gridRow(int row, int columns, int count, Widget Function(int i) cardAt) {
+  final cells = [
+    for (var i = row * columns; i < (row + 1) * columns && i < count; i++)
+      cardAt(i),
+  ];
+  return columns == 1 ? cells.single : GridRow(columns: columns, cells: cells);
+}
+
+/// [cards] grouped into [GridRow]s of [columns]; unchanged when [columns] is 1.
+List<Widget> gridRows(List<Widget> cards, int columns) {
+  if (columns <= 1) return cards;
+  return [
+    for (var i = 0; i < cards.length; i += columns)
+      GridRow(
+        columns: columns,
+        cells: cards.sublist(
+            i, i + columns < cards.length ? i + columns : cards.length),
+      ),
+  ];
+}
+
+/// [padding] with its sides widened so a form or detail page sits centred at
+/// no more than [maxWidth] in a wide window. Used as the page's scroll padding,
+/// so the whole window still scrolls. A phone gets [padding] unchanged.
+EdgeInsets readablePadding(BuildContext context, EdgeInsets padding,
+    {double maxWidth = 760}) {
+  final side = (MediaQuery.sizeOf(context).width - maxWidth) / 2;
+  return padding.copyWith(
+    left: side > padding.left ? side : padding.left,
+    right: side > padding.right ? side : padding.right,
+  );
+}

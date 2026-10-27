@@ -140,7 +140,7 @@ class _AdminStudentDetailScreenState extends State<AdminStudentDetailScreen> {
     final name = '${_student['name'] ?? 'Student'}';
     return Scaffold(
       appBar: AppBar(title: const Text('Student')),
-      body: ListView(padding: const EdgeInsets.all(16), children: [
+      body: ListView(padding: readablePadding(context, const EdgeInsets.all(16), maxWidth: 900), children: [
         // Header
         Container(
           padding: const EdgeInsets.all(16),
@@ -307,10 +307,16 @@ class _AdminStudentDetailScreenState extends State<AdminStudentDetailScreen> {
 
   Widget _txnCard(dynamic e) {
     final status = '${e['status'] ?? ''}';
-    final color = status == 'Approved' ? AppTheme.success
+    // Approved items still at the lab, and overdue ones, say so (2026-10-06).
+    final ready = ApiService.awaitingPickup(e);
+    final overdue = ApiService.isOverdue(e);
+    final color = ready ? AppTheme.primary
+        : overdue ? AppTheme.danger
+        : status == 'Approved' ? AppTheme.success
         : status == 'Pending' ? AppTheme.accent
         : status == 'Rejected' ? AppTheme.danger
         : AppTheme.textMid;
+    final label = ready ? 'Ready for pick-up' : overdue ? 'Overdue' : status;
     final borrow = '${e['borrow_date'] ?? ''}'.split('T').first;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -328,12 +334,13 @@ class _AdminStudentDetailScreenState extends State<AdminStudentDetailScreen> {
             // "Borrowed:" for equipment the student never received
             // (QA 2026-09-19, low #12).
             Text(
-                status == 'Pending' || status == 'Rejected'
+                status == 'Pending' || status == 'Rejected' ||
+                        status == 'Cancelled' || ready
                     ? 'Requested: $borrow'
                     : 'Borrowed: $borrow',
                 style: const TextStyle(fontSize: 11, color: AppTheme.textMid)),
         ])),
-        StatusBadge(label: status, color: color),
+        StatusBadge(label: label, color: color),
       ]),
     );
   }

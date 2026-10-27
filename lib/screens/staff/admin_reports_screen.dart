@@ -2,15 +2,39 @@
 // LabTrack - staff: admin reports screen
 //
 // Extracted from firstFile.dart on 2026-08-03 as step 7 of the module split.
+//
+// 2026-10-07: back to the 1.0.16 page, as the user asked: the 1.0.17 redesign
+// (period picker, "At a glance", explained figures, Copy Summary) was more
+// than they wanted. Only the download changed: the web portal's "Download
+// Excel Report (.xlsx)" saves the workbook from report_xlsx.dart (Summary +
+// Borrowing records) instead of the old .csv. Kept from 1.0.17 because they
+// are fixes, not looks: no second title bar under the staff header (the
+// refresh button sits on the period line instead), Overdue Items counts every
+// loan still out as the Dashboard does (not only those sent in the last 90
+// days), a message instead of zeros when loading fails, and Most Borrowed by
+// item type (ApiService.reportMetrics).
+//
+// 2026-10-07, later: "Export Full Report" opens the report as a readable page
+// (full_report_screen.dart) instead of a green-on-black, terminal-style text
+// dialog, which the lab staff found confusing. Copy Report is on that page,
+// and (later still) "Change dates" for any period and, on the web portal,
+// Download Excel and Download PDF to print. Every form comes from one
+// FullReport, so this page's Excel button saves the same workbook for its
+// 90 days.
 // -----------------------------------------------------------------------------
 
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../../services/api_service.dart';
+import '../../services/file_download.dart';
+import '../../services/full_report.dart';
+import '../../services/report_xlsx.dart';
+import '../../services/session.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
+import 'full_report_screen.dart';
 
 // ─── Admin Reports Screen ──────────────────────────────────────────────────────
 
@@ -22,7 +46,7 @@ class AdminReportsScreen extends StatefulWidget {
 
 class _AdminReportsScreenState extends State<AdminReportsScreen> {
   bool _loading = true;
-  bool _exporting = false;
+  bool _failed = false;
 
   // Reporting window. Borrowing figures below cover this many days back, not
   // all time — see the note in _load(). Surfaced in the UI and the exported
@@ -50,178 +74,156 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
   }
 
   Future<void> _load() async {
-    setState(() => _loading = true);
+    setState(() {
+      _loading = true;
+      _failed = false;
+    });
     try {
       // Scoped to a reporting period rather than all-time: borrow_transactions
       // grows forever, so an unbounded read here gets more expensive every
-      // semester. Equipment and damage totals are counted server-side.
-      final cutoff = DateTime.now().subtract(Duration(days: _reportPeriodDays));
+      // semester. Equipment and damage totals are counted server-side. All
+      // start before any is awaited, so they run concurrently.
+      final now     = DateTime.now();
+      final cutoff  = now.subtract(const Duration(days: _reportPeriodDays));
       final txF     = ApiService.getRequestsSince(cutoff);
-      final eqF     = ApiService.getEquipmentCounts();
+      final openF   = ApiService.getOpenRequests();
+      final eqF     = ApiService.getEquipmentStatusCounts();
       final damageF = ApiService.damageReportCount();
       final txSnap        = await txF;
-      final eqCounts      = await eqF;
+      final open          = await openF;
+      final equipment     = await eqF;
       final damageReports = await damageF;
 
       // Borrowing stats. The counting rules live in ApiService.reportMetrics so
       // they are unit-tested rather than done by hand here — the hand-rolled
       // version counted Pending and Rejected requests as borrowings and worked
       // out "on time" without ever looking at a return date (QA 2026-09-19, M2).
-      final m = ApiService.reportMetrics(txSnap);
+      final m = ApiService.reportMetrics(txSnap, now: now);
 
+      if (!mounted) return;
       setState(() {
         _totalBorrowings  = m['borrowings'] as int;
         _totalReturned    = m['returned'] as int;
-        _totalOverdue     = m['overdue'] as int;
+        // Every loan still out past its time, whenever it was sent, as on the
+        // Dashboard: one sent before the period used to be left out.
+        _totalOverdue     = ApiService.overdueLoans(open, now: now).length;
         _totalDamage      = damageReports;
-        _totalEquipment   = eqCounts.total;
+        _totalEquipment   = equipment['Total'] ?? 0;
         _onTimeRate       = m['onTimeRate'] as double;
         _mostBorrowed     = m['mostBorrowed'] as Map<String, int>;
         _allTransactions  = txSnap;
         _loading          = false;
       });
     } catch (e) {
-      setState(() => _loading = false);
-    }
-  }
-
-  // ── Generate and share a text report ──────────────────────────────────────
-  Future<void> _exportReport() async {
-    setState(() => _exporting = true);
-
-    try {
-      final now = DateTime.now();
-      final dateStr =
-          '${now.year}-${now.month.toString().padLeft(2,'0')}-${now.day.toString().padLeft(2,'0')}';
-      final timeStr =
-          '${now.hour.toString().padLeft(2,'0')}:${now.minute.toString().padLeft(2,'0')}';
-
-      // Build report text
-      final buf = StringBuffer();
-      buf.writeln('==============================================');
-      buf.writeln('  LABTRACK — CEA LABORATORY REPORT');
-      buf.writeln('  New Era University');
-      buf.writeln('  Generated: $dateStr at $timeStr');
-      buf.writeln('==============================================');
-      buf.writeln('');
-      buf.writeln('SUMMARY  (last $_reportPeriodDays days)');
-      buf.writeln('----------------------------------------------');
-      buf.writeln('Borrowing figures below cover the last '
-          '$_reportPeriodDays days. Equipment and damage report');
-      buf.writeln('totals are current counts.');
-      buf.writeln('');
-      buf.writeln('Total Borrowings   : $_totalBorrowings');
-      buf.writeln('Total Returned     : $_totalReturned');
-      buf.writeln('Total Overdue      : $_totalOverdue');
-      buf.writeln('Damage Reports     : $_totalDamage');
-      buf.writeln('Total Equipment    : $_totalEquipment');
-      buf.writeln('On-Time Return Rate: ${_onTimeRate.toStringAsFixed(1)}%');
-      buf.writeln('');
-      buf.writeln('MOST BORROWED EQUIPMENT');
-      buf.writeln('----------------------------------------------');
-      int rank = 1;
-      _mostBorrowed.forEach((name, cnt) {
-        buf.writeln('$rank. $name — ${cnt}x borrowed');
-        rank++;
-      });
-
-      if (_allTransactions.isNotEmpty) {
-        buf.writeln('');
-        buf.writeln('TRANSACTION LOG');
-        buf.writeln('----------------------------------------------');
-        for (final tx in _allTransactions) {
-          final status  = tx['status'] ?? '';
-          final student = tx['borrower_name'] ?? tx['student_number'] ?? '—';
-          final equip   = tx['equipment_name'] ?? '—';
-          final bDate   = '${tx['borrow_date'] ?? ''}'.split('T').first;
-          buf.writeln('[$status] $student | $equip | $bDate');
-        }
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _failed = true;
+        });
       }
-
-      buf.writeln('');
-      buf.writeln('==============================================');
-      buf.writeln('  END OF REPORT — LabTrack v1.0');
-      buf.writeln('==============================================');
-
-      final reportText = buf.toString();
-
-      // Show report in a dialog with copy option
-      if (!mounted) return;
-      showDialog(
-        context: context,
-        builder: (_) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: Row(children: const [
-            Icon(Icons.assessment_rounded, color: AppTheme.primary),
-            SizedBox(width: 10),
-            Text('Full Report'),
-          ]),
-          content: SizedBox(
-            width: double.maxFinite,
-            height: 400,
-            child: Column(
-              children: [
-                Expanded(
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1E1E1E),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: SingleChildScrollView(
-                      child: Text(
-                        reportText,
-                        style: const TextStyle(
-                          fontFamily: 'Courier New',
-                          fontSize: 11,
-                          color: Color(0xFF00FF88),
-                          height: 1.5,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  'Tap "Copy" to copy the report to your clipboard.',
-                  style: TextStyle(fontSize: 12, color: AppTheme.textMid),
-                  textAlign: TextAlign.center,
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Close', style: TextStyle(color: AppTheme.textMid)),
-            ),
-            ElevatedButton.icon(
-              onPressed: () {
-                // Copy to clipboard
-                // ignore: deprecated_member_use
-                Clipboard.setData(ClipboardData(text: reportText));
-                Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('✅ Report copied to clipboard! Paste it in Notes or Email.'),
-                    backgroundColor: AppTheme.success,
-                    behavior: SnackBarBehavior.floating,
-                  ),
-                );
-              },
-              icon: const Icon(Icons.copy_rounded),
-              label: const Text('Copy Report'),
-            ),
-          ],
-        ),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Export failed: $e'), backgroundColor: AppTheme.danger));
-    } finally {
-      if (mounted) setState(() => _exporting = false);
     }
   }
+
+  // ── The full report, as a page anyone can read ───────────────────────────
+  // 2026-10-07: it used to be a terminal-style text dialog (green on black,
+  // "=====" lines, "[Approved] name | item | date"). The page and the text
+  // Copy Report gives are in full_report_screen.dart and full_report.dart.
+  // This page's 90 days as a report: what Export Full Report opens and what
+  // Download Excel Report saves.
+  FullReport _fullReport() => FullReport(
+        madeAt:          DateTime.now(),
+        madeBy:          Session.name,
+        days:            _reportPeriodDays,
+        totalBorrowings: _totalBorrowings,
+        totalReturned:   _totalReturned,
+        totalOverdue:    _totalOverdue,
+        totalDamage:     _totalDamage,
+        totalEquipment:  _totalEquipment,
+        onTimeRate:      _onTimeRate,
+        mostBorrowed:    _mostBorrowed,
+        requests:        _allTransactions,
+      );
+
+  // The report for dates staff chose on the Full Report page ("Change dates",
+  // 2026-10-07). Worked out like this page's 90 days; overdue items,
+  // equipment and damage reports are counted as of today, as here.
+  Future<FullReport> _reportFor(DateTime start, DateTime end) async {
+    final now   = DateTime.now();
+    final from  = DateTime(start.year, start.month, start.day);
+    final until = DateTime(end.year, end.month, end.day).add(const Duration(days: 1));
+    final txF     = ApiService.getRequestsBetween(from, until);
+    final openF   = ApiService.getOpenRequests();
+    final eqF     = ApiService.getEquipmentStatusCounts();
+    final damageF = ApiService.damageReportCount();
+    final txns      = await txF;
+    final open      = await openF;
+    final equipment = await eqF;
+    final damage    = await damageF;
+    final m = ApiService.reportMetrics(txns, now: now);
+    return FullReport(
+      madeAt:          now,
+      madeBy:          Session.name,
+      start:           from,
+      end:             DateTime(end.year, end.month, end.day),
+      totalBorrowings: m['borrowings'] as int,
+      totalReturned:   m['returned'] as int,
+      totalOverdue:    ApiService.overdueLoans(open, now: now).length,
+      totalDamage:     damage,
+      totalEquipment:  equipment['Total'] ?? 0,
+      onTimeRate:      m['onTimeRate'] as double,
+      mostBorrowed:    m['mostBorrowed'] as Map<String, int>,
+      requests:        txns,
+    );
+  }
+
+  void _exportReport() {
+    Navigator.push(
+        context,
+        MaterialPageRoute(
+            builder: (_) =>
+                FullReportScreen(report: _fullReport(), loadPeriod: _reportFor)));
+  }
+
+  // ── Web portal: the period as an Excel workbook ───────────────────────────
+  // 2026-10-07: replaces the .csv. The same workbook as the Full Report's
+  // Download Excel, for this page's 90 days: Report (as the PDF), Requests,
+  // Borrowing records; see report_xlsx.dart.
+  void _downloadXlsx() {
+    final report = _fullReport();
+    final bytes = ReportXlsx.build(report);
+    final ok = downloadBytes(ReportXlsx.fileName(report), bytes,
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(ok
+          ? 'Downloaded the Excel report: ${_allTransactions.length} '
+              '${_allTransactions.length == 1 ? 'record' : 'records'} '
+              '(last $_reportPeriodDays days).'
+          : 'Downloading is available in the web portal.'),
+      backgroundColor: ok ? AppTheme.success : AppTheme.danger,
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  // The period line, with the refresh button that used to sit in this page's
+  // own title bar.
+  Widget _periodLine() => Row(children: [
+        const Icon(Icons.event_note_outlined,
+            size: 14, color: AppTheme.textMid),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text('Borrowing activity — last $_reportPeriodDays days',
+              style: const TextStyle(
+                  fontSize: 12,
+                  color: AppTheme.textMid,
+                  fontWeight: FontWeight.w600)),
+        ),
+        IconButton(
+          icon: const Icon(Icons.refresh_rounded, color: AppTheme.primary),
+          onPressed: _load,
+          tooltip: 'Refresh',
+          visualDensity: VisualDensity.compact,
+        ),
+      ]);
 
   @override
   Widget build(BuildContext context) {
@@ -229,22 +231,67 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    // Build most borrowed bars
-    final maxCount = _mostBorrowed.values.isEmpty
-        ? 1
-        : _mostBorrowed.values.reduce((a, b) => a > b ? a : b);
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Reports'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh_rounded),
-            onPressed: _load,
-            tooltip: 'Refresh',
-          ),
-        ],
+    // Two report cards per row on a phone, three on a wide window, all six in
+    // one row on a full-size monitor (as on the Dashboard).
+    final width = MediaQuery.sizeOf(context).width;
+    final cardsPerRow = width >= 1400 ? 6 : width >= 900 ? 3 : 2;
+    final cards = [
+      _ReportCard(
+        label: 'Total\nBorrowings',
+        value: '$_totalBorrowings',
+        icon: Icons.trending_up_rounded,
+        color: AppTheme.accent,
       ),
+      _ReportCard(
+        label: 'On-Time\nReturns',
+        value: '${_onTimeRate.toStringAsFixed(0)}%',
+        icon: Icons.check_circle_outline_rounded,
+        color: AppTheme.success,
+      ),
+      _ReportCard(
+        label: 'Overdue\nItems',
+        value: '$_totalOverdue',
+        icon: Icons.warning_amber_rounded,
+        color: AppTheme.danger,
+      ),
+      _ReportCard(
+        label: 'Damage\nReports',
+        value: '$_totalDamage',
+        icon: Icons.report_problem_outlined,
+        color: AppTheme.warning,
+      ),
+      _ReportCard(
+        label: 'Total\nEquipment',
+        value: '$_totalEquipment',
+        icon: Icons.science_rounded,
+        color: AppTheme.primary,
+      ),
+      _ReportCard(
+        label: 'Returned\nSuccessfully',
+        value: '$_totalReturned',
+        icon: Icons.assignment_return_rounded,
+        color: AppTheme.success,
+      ),
+    ];
+    final exportButton = ElevatedButton.icon(
+      onPressed: _exportReport,
+      icon: const Icon(Icons.download_rounded),
+      label: const Text('Export Full Report'),
+      style: ElevatedButton.styleFrom(
+          backgroundColor: AppTheme.primary,
+          padding: const EdgeInsets.symmetric(vertical: 14)),
+    );
+    final xlsxButton = OutlinedButton.icon(
+      onPressed: _downloadXlsx,
+      icon: const Icon(Icons.table_view_rounded),
+      label: const Text('Download Excel Report (.xlsx)'),
+      style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(vertical: 14)),
+    );
+
+    // No title bar of its own: the staff header above already says "Reports"
+    // (until 2026-10-06 this page showed a second one).
+    return Scaffold(
       body: RefreshIndicator(
         onRefresh: _load,
         child: SingleChildScrollView(
@@ -255,226 +302,238 @@ class _AdminReportsScreenState extends State<AdminReportsScreen> {
             children: [
 
               // Borrowing figures are scoped to a period, not all-time.
-              Row(children: [
-                const Icon(Icons.event_note_outlined,
-                    size: 14, color: AppTheme.textMid),
-                const SizedBox(width: 6),
-                Text('Borrowing activity — last $_reportPeriodDays days',
-                    style: const TextStyle(
-                        fontSize: 12,
-                        color: AppTheme.textMid,
-                        fontWeight: FontWeight.w600)),
-              ]),
+              _periodLine(),
               const SizedBox(height: 12),
+
+              if (_failed)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(14)),
+                  child: const Text(
+                      'Could not load the report. Pull down or tap refresh to try again.',
+                      style: TextStyle(color: AppTheme.textMid)),
+                )
+              else ...[
 
               // ── Summary Cards ──
-              Row(children: [
-                _ReportCard(
-                  label: 'Total\nBorrowings',
-                  value: '$_totalBorrowings',
-                  icon: Icons.trending_up_rounded,
-                  color: AppTheme.accent,
-                ),
-                const SizedBox(width: 12),
-                _ReportCard(
-                  label: 'On-Time\nReturns',
-                  value: '${_onTimeRate.toStringAsFixed(0)}%',
-                  icon: Icons.check_circle_outline_rounded,
-                  color: AppTheme.success,
-                ),
-              ]),
-              const SizedBox(height: 12),
-              Row(children: [
-                _ReportCard(
-                  label: 'Overdue\nItems',
-                  value: '$_totalOverdue',
-                  icon: Icons.warning_amber_rounded,
-                  color: AppTheme.danger,
-                ),
-                const SizedBox(width: 12),
-                _ReportCard(
-                  label: 'Damage\nReports',
-                  value: '$_totalDamage',
-                  icon: Icons.report_problem_outlined,
-                  color: AppTheme.warning,
-                ),
-              ]),
-              const SizedBox(height: 12),
-              Row(children: [
-                _ReportCard(
-                  label: 'Total\nEquipment',
-                  value: '$_totalEquipment',
-                  icon: Icons.science_rounded,
-                  color: AppTheme.primary,
-                ),
-                const SizedBox(width: 12),
-                _ReportCard(
-                  label: 'Returned\nSuccessfully',
-                  value: '$_totalReturned',
-                  icon: Icons.assignment_return_rounded,
-                  color: AppTheme.success,
-                ),
-              ]),
+              for (var i = 0; i < cards.length; i += cardsPerRow) ...[
+                if (i > 0) const SizedBox(height: 12),
+                Row(children: [
+                  for (var j = i; j < i + cardsPerRow; j++) ...[
+                    if (j > i) const SizedBox(width: 12),
+                    cards[j],
+                  ],
+                ]),
+              ],
               const SizedBox(height: 24),
 
-              // ── Most Borrowed ──
-              const SectionHeader(title: 'Most Borrowed Equipment'),
-              const SizedBox(height: 12),
-              if (_mostBorrowed.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(14)),
-                  child: const Center(
-                    child: Text('No borrowing data yet.',
-                        style: TextStyle(color: AppTheme.textMid)),
-                  ),
-                )
-              else
-                ..._mostBorrowed.entries.map((e) {
-                  final ratio = maxCount > 0 ? e.value / maxCount : 0.0;
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(14)),
-                      child: Row(children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(e.key,
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 13,
-                                      color: AppTheme.textDark)),
-                              const SizedBox(height: 6),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(4),
-                                child: LinearProgressIndicator(
-                                  value: ratio,
-                                  minHeight: 6,
-                                  backgroundColor: AppTheme.divider,
-                                  valueColor: const AlwaysStoppedAnimation(
-                                      AppTheme.accent),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 16),
-                        Text('${e.value}x',
-                            style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: AppTheme.accent)),
-                      ]),
+              // ── Most Borrowed and Recent Transactions ──
+              // Side by side on a full-size monitor.
+              if (width >= 1200)
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: _mostBorrowedSection()),
                     ),
-                  );
-                }),
+                    const SizedBox(width: 20),
+                    Expanded(
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: _recentSection()),
+                    ),
+                  ],
+                )
+              else ...[
+                ..._mostBorrowedSection(),
+                const SizedBox(height: 24),
+                ..._recentSection(),
+              ],
               const SizedBox(height: 24),
 
-              // ── Recent Transactions ──
-              const SectionHeader(title: 'Recent Transactions'),
-              const SizedBox(height: 12),
-              if (_allTransactions.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(14)),
-                  child: const Center(
-                    child: Text('No transactions yet.',
-                        style: TextStyle(color: AppTheme.textMid)),
+              // ── Export Buttons ── (side by side on a wide window)
+              if (kIsWeb && width >= 900)
+                IntrinsicHeight(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Expanded(child: exportButton),
+                      const SizedBox(width: 12),
+                      Expanded(child: xlsxButton),
+                    ],
                   ),
                 )
-              else
-                Container(
-                  decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(14)),
-                  child: Column(
-                    children: _allTransactions.take(8).map((tx) {
-                      final status   = tx['status'] ?? '';
-                      final student  = tx['borrower_name'] ??
-                          tx['student_number'] ?? '—';
-                      final equip    = tx['equipment_name'] ?? '—';
-                      final bDate    =
-                          '${tx['borrow_date'] ?? ''}'.split('T').first.split(' ').first;
-                      final sc = status == 'Approved' ? AppTheme.success
-                               : status == 'Pending'  ? AppTheme.accent
-                               : status == 'Returned' ? AppTheme.textMid
-                               : AppTheme.danger;
-                      return Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(
-                          border: Border(
-                            bottom: BorderSide(color: AppTheme.divider),
-                          ),
-                        ),
-                        child: Row(children: [
-                          Container(
-                            width: 8, height: 8,
-                            decoration: BoxDecoration(
-                                color: sc, shape: BoxShape.circle),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                            Text(student, style: const TextStyle(
-                                fontSize: 12, fontWeight: FontWeight.bold,
-                                color: AppTheme.textDark)),
-                            Text(equip, style: const TextStyle(
-                                fontSize: 11, color: AppTheme.textMid)),
-                          ])),
-                          Column(crossAxisAlignment: CrossAxisAlignment.end,
-                              children: [
-                            StatusBadge(label: status, color: sc),
-                            const SizedBox(height: 2),
-                            Text(bDate, style: const TextStyle(
-                                fontSize: 10, color: AppTheme.textLight)),
-                          ]),
-                        ]),
-                      );
-                    }).toList(),
-                  ),
-                ),
-              const SizedBox(height: 24),
-
-              // ── Export Button ──
+              else ...[
+                SizedBox(width: double.infinity, child: exportButton),
+                if (kIsWeb) ...[
+                  const SizedBox(height: 10),
+                  SizedBox(width: double.infinity, child: xlsxButton),
+                ],
+              ],
+              const SizedBox(height: 8),
+              // Full width, so it stays centred when it fits on one line.
               SizedBox(
                 width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: _exporting ? null : _exportReport,
-                  icon: _exporting
-                      ? const SizedBox(
-                          width: 16, height: 16,
-                          child: CircularProgressIndicator(
-                              color: Colors.white, strokeWidth: 2))
-                      : const Icon(Icons.download_rounded),
-                  label: Text(_exporting ? 'Generating...' : 'Export Full Report'),
-                  style: ElevatedButton.styleFrom(
-                      backgroundColor: AppTheme.primary,
-                      padding: const EdgeInsets.symmetric(vertical: 14)),
+                child: Text(
+                  kIsWeb
+                      ? 'Export Full Report shows the whole report on one page: '
+                          'choose its dates there, copy it, or download it as an '
+                          'Excel workbook or as a PDF to print. Download Excel '
+                          'Report saves the last $_reportPeriodDays days.'
+                      : 'Export Full Report shows the whole report on one page; '
+                          'you can choose its dates there. Copy Report puts it on '
+                          'your clipboard for Notes, Email, or Google Docs.',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 11, color: AppTheme.textMid),
                 ),
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'Report will be copied to your clipboard — paste it in Notes, Email, or Google Docs.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 11, color: AppTheme.textMid),
-              ),
               const SizedBox(height: 20),
+              ],
             ],
           ),
         ),
       ),
     );
   }
+
+  // ── Most Borrowed ──
+  List<Widget> _mostBorrowedSection() {
+    final maxCount = _mostBorrowed.values.isEmpty
+        ? 1
+        : _mostBorrowed.values.reduce((a, b) => a > b ? a : b);
+    return [
+      const SectionHeader(title: 'Most Borrowed Equipment'),
+      const SizedBox(height: 12),
+      if (_mostBorrowed.isEmpty)
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(14)),
+          child: const Center(
+            child: Text('No borrowing data yet.',
+                style: TextStyle(color: AppTheme.textMid)),
+          ),
+        )
+      else
+        ..._mostBorrowed.entries.map((e) {
+          final ratio = maxCount > 0 ? e.value / maxCount : 0.0;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(14)),
+              child: Row(children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(e.key,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              color: AppTheme.textDark)),
+                      const SizedBox(height: 6),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: ratio,
+                          minHeight: 6,
+                          backgroundColor: AppTheme.divider,
+                          valueColor: const AlwaysStoppedAnimation(
+                              AppTheme.accent),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 16),
+                Text('${e.value}x',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.accent)),
+              ]),
+            ),
+          );
+        }),
+    ];
+  }
+
+  // ── Recent Transactions ──
+  List<Widget> _recentSection() => [
+        const SectionHeader(title: 'Recent Transactions'),
+        const SizedBox(height: 12),
+        if (_allTransactions.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14)),
+            child: const Center(
+              child: Text('No transactions yet.',
+                  style: TextStyle(color: AppTheme.textMid)),
+            ),
+          )
+        else
+          Container(
+            decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14)),
+            child: Column(
+              children: _allTransactions.take(8).map((tx) {
+                final status   = tx['status'] ?? '';
+                final student  = tx['borrower_name'] ??
+                    tx['student_number'] ?? '—';
+                final equip    = tx['equipment_name'] ?? '—';
+                final bDate    =
+                    '${tx['borrow_date'] ?? ''}'.split('T').first.split(' ').first;
+                // The same colours as the full report (Cancelled, new in
+                // 1.0.17, is grey, as on Requests).
+                final sc = reportStatusColor('$status');
+                return Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(color: AppTheme.divider),
+                    ),
+                  ),
+                  child: Row(children: [
+                    Container(
+                      width: 8, height: 8,
+                      decoration: BoxDecoration(
+                          color: sc, shape: BoxShape.circle),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text(student, style: const TextStyle(
+                          fontSize: 12, fontWeight: FontWeight.bold,
+                          color: AppTheme.textDark)),
+                      Text(equip, style: const TextStyle(
+                          fontSize: 11, color: AppTheme.textMid)),
+                    ])),
+                    Column(crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                      StatusBadge(label: status, color: sc),
+                      const SizedBox(height: 2),
+                      Text(bDate, style: const TextStyle(
+                          fontSize: 10, color: AppTheme.textLight)),
+                    ]),
+                  ]),
+                );
+              }).toList(),
+            ),
+          ),
+      ];
 }
 
 class _ReportCard extends StatelessWidget {

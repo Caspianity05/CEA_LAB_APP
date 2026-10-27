@@ -15,6 +15,7 @@ import 'alerts_screen.dart';
 import 'equipment_catalog_screen.dart';
 import 'borrow_request_screen.dart';
 import 'damage_report_screen.dart';
+import 'how_it_works_screen.dart';
 import 'lab_policies_screen.dart';
 import 'my_borrowings_screen.dart';
 import 'profile_screen.dart';
@@ -36,6 +37,14 @@ class _StudentHomeScreenState extends State<StudentHomeScreen> {
     const MyBorrowingsScreen(),
     const ProfileScreen(),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    // The four steps of a loan, once per student on this phone (2026-10-06).
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => HowItWorksScreen.showOnce(context, Session.studentId));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -135,18 +144,17 @@ class _StudentDashboardState extends State<_StudentDashboard> {
   List<dynamic> get _pendingLoans =>
       _allLoans.where((e) => e['status'] == 'Pending').toList();
 
+  // Due today and overdue count only items the student has: approved items
+  // still waiting at the lab are not theirs yet (2026-10-06).
   int get _dueToday => _activeLoans.where((e) {
+    if (!ApiService.isOut(e)) return false;
     final due = DateTime.tryParse('${e['due_date']}'.replaceAll(' ', 'T'));
     if (due == null) return false;
     final now = DateTime.now();
     return due.year == now.year && due.month == now.month && due.day == now.day;
   }).length;
 
-  int get _overdue => _activeLoans.where((e) {
-    final due = DateTime.tryParse('${e['due_date']}'.replaceAll(' ', 'T'));
-    if (due == null) return false;
-    return due.isBefore(DateTime.now());
-  }).length;
+  int get _overdue => ApiService.overdueLoans(_activeLoans).length;
 
   // Build notification cards from live loan statuses
   // How long a one-off alert stays on Home. Overdue and Due Today are live
@@ -194,21 +202,20 @@ class _StudentDashboardState extends State<_StudentDashboard> {
       final approved = request.where((t) => t['status'] == 'Approved').toList();
       final returned = request.where((t) => t['status'] == 'Returned').toList();
       final rejected = request.where((t) => t['status'] == 'Rejected').toList();
+      final cancelled = request.where(ApiService.cancelledByStaff).toList();
 
       // Check overdue FIRST. The due date is 5:00 PM the same day, so an
       // item borrowed today and not returned by 5 is both "due today" and
       // overdue — and the due-today branch used to win, leaving the card
       // reading "due back today before 5:00 PM" at 10 PM while the Active
       // Loans list right below it badged the very same item "Overdue".
-      final overdue = approved.where((t) {
-        final due = _dueOf(t);
-        return due != null && due.isBefore(now);
-      }).toList();
+      final overdue = ApiService.overdueLoans(approved, now: now);
       final dueToday = approved.where((t) {
         final due = _dueOf(t);
-        return due != null && !due.isBefore(now) &&
+        return ApiService.isOut(t) && due != null && !due.isBefore(now) &&
             due.year == now.year && due.month == now.month && due.day == now.day;
       }).toList();
+      final waiting = approved.where(ApiService.awaitingPickup).toList();
 
       // Each card type honours the corresponding toggle in
       // Profile → Notifications (NotifPrefs).
@@ -230,8 +237,10 @@ class _StudentDashboardState extends State<_StudentDashboard> {
           'icon':  Icons.access_alarm_rounded,
           'color': AppTheme.warning,
           'title': 'Due Today',
+          // The time staff set, which can be later than 5:00 PM (2026-10-06).
           'body':  '${_itemsOf(dueToday)} ${dueToday.length == 1 ? 'is' : 'are'} '
-              'due back today before 5:00 PM.',
+              'due back today by '
+              '${TimeOfDay.fromDateTime(_dueOf(dueToday.first)!).format(context)}.',
           'at':    _dueOf(dueToday.first)!,
           'live':  true,
         });
@@ -267,10 +276,13 @@ class _StudentDashboardState extends State<_StudentDashboard> {
           notes.add({
             'icon':  Icons.check_circle_rounded,
             'color': AppTheme.success,
-            'title': 'Request Approved',
+            'title': waiting.isNotEmpty ? 'Ready for Pick-up' : 'Request Approved',
             'body':  'Your request for ${ApiService.requestSummary(approved)} '
-                'has been approved. Pick it up at the lab.',
+                'has been approved.'
+                '${waiting.isNotEmpty ? ' Pick it up at the lab.' : ''}',
             'at':    at,
+            // Stays on Home while something waits at the lab for them.
+            'live':  waiting.isNotEmpty,
           });
         }
       }
@@ -285,6 +297,24 @@ class _StudentDashboardState extends State<_StudentDashboard> {
           'body':  'Your request for ${ApiService.requestSummary(rejected)} was '
               'rejected by staff${reason.isEmpty ? '.' : ': $reason'}',
           'at':    ApiService.asDate(first['rejected_at']) ??
+                   ApiService.asDate(first['borrow_date']) ?? DateTime(2000),
+        });
+      }
+      // Staff cancelled an approved request the student never picked up. The
+      // "Ready for Pick-up" card used to just disappear, and only History said
+      // why (live test 2026-10-07). It follows the Request Rejected switch:
+      // both are staff turning a request down. The student's own cancel needs
+      // no alert.
+      if (NotifPrefs.rejected && cancelled.isNotEmpty) {
+        final first = cancelled.first;
+        final reason = '${first['cancel_reason'] ?? ''}'.trim();
+        notes.add({
+          'icon':  Icons.do_not_disturb_on_rounded,
+          'color': AppTheme.danger,
+          'title': 'Request Cancelled',
+          'body':  'Your request for ${ApiService.requestSummary(cancelled)} was '
+              'cancelled by staff${reason.isEmpty ? '.' : ': $reason.'}',
+          'at':    ApiService.asDate(first['cancelled_at']) ??
                    ApiService.asDate(first['borrow_date']) ?? DateTime(2000),
         });
       }
@@ -611,8 +641,14 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                           icon: Icons.add_circle_rounded,
                           label: 'New\nRequest',
                           gradient: const [Color(0xFF1B3A8C), Color(0xFF1E4DB7)],
-                          onTap: () => Navigator.push(context,
-                              MaterialPageRoute(builder: (_) => const BorrowRequestScreen())),
+                          // Reload on the way back, so a request just sent
+                          // shows in the counts at once (it used to need a
+                          // pull-down; QA 2026-10-06).
+                          onTap: () async {
+                            await Navigator.push(context,
+                                MaterialPageRoute(builder: (_) => const BorrowRequestScreen()));
+                            if (mounted) _load();
+                          },
                         ),
                         const SizedBox(width: 10),
                         _ActionTile(
@@ -685,20 +721,29 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                           final due = DateTime.tryParse(
                               '${e['due_date']}'.replaceAll(' ', 'T'));
                           final now2 = DateTime.now();
-                          final isOverdue = due != null && due.isBefore(now2);
-                          final isDueToday = due != null &&
+                          // Approved but still at the lab (2026-10-06).
+                          final isReady = ApiService.awaitingPickup(e);
+                          final isOverdue = ApiService.isOverdue(e, now: now2);
+                          final isDueToday = !isReady && due != null &&
                               due.year == now2.year &&
                               due.month == now2.month &&
                               due.day == now2.day;
-                          final status = isOverdue ? 'Overdue'
+                          final status = isReady ? 'Ready'
+                              : isOverdue ? 'Overdue'
                               : isDueToday ? 'Due Today' : 'Active';
-                          final statusColor = isOverdue
-                              ? const Color(0xFFEF4444)
-                              : isDueToday
-                                  ? const Color(0xFFD97706)
-                                  : const Color(0xFF059669);
+                          final statusColor = isReady
+                              ? AppTheme.primary
+                              : isOverdue
+                                  ? const Color(0xFFEF4444)
+                                  : isDueToday
+                                      ? const Color(0xFFD97706)
+                                      : const Color(0xFF059669);
+                          // The real time: the student may pick an earlier
+                          // one, and staff a later one. This always read
+                          // 5:00 PM.
                           final dueStr = due != null
-                              ? '${due.month}/${due.day} · 5:00 PM'
+                              ? '${due.month}/${due.day} · '
+                                  '${TimeOfDay.fromDateTime(due).format(context)}'
                               : '';
                           return Padding(
                             padding: const EdgeInsets.only(bottom: 10),
@@ -707,12 +752,16 @@ class _StudentDashboardState extends State<_StudentDashboard> {
                               qr: '${e['qr_code'] ?? ''}',
                               status: status,
                               statusColor: statusColor,
-                              subtitle: 'Return by $dueStr',
-                              icon: isOverdue
-                                  ? Icons.warning_amber_rounded
-                                  : isDueToday
-                                      ? Icons.access_alarm_rounded
-                                      : Icons.check_circle_outline_rounded,
+                              subtitle: isReady
+                                  ? 'Pick it up at the lab'
+                                  : 'Return by $dueStr',
+                              icon: isReady
+                                  ? Icons.storefront_outlined
+                                  : isOverdue
+                                      ? Icons.warning_amber_rounded
+                                      : isDueToday
+                                          ? Icons.access_alarm_rounded
+                                          : Icons.check_circle_outline_rounded,
                             ),
                           );
                         }),

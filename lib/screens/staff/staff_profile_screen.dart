@@ -131,7 +131,7 @@ class _StaffProfileScreenState extends State<StaffProfileScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('My Profile')),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
+        padding: readablePadding(context, const EdgeInsets.all(24), maxWidth: 640),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

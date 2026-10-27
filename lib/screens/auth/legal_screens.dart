@@ -69,7 +69,7 @@ class TermsAndConditionsScreen extends StatelessWidget {
                 _TermsSection(
                   number: '4',
                   title: 'Return Policy',
-                  body: 'All borrowed equipment must be returned to the CEA laboratory on the same day of borrowing, before 5:00 PM. Equipment not returned by the agreed return time will be marked as overdue. Repeated late returns may result in temporary suspension of your borrowing privileges for a period determined by laboratory staff.',
+                  body: 'All borrowed equipment must be returned to the CEA laboratory on the same day of borrowing, by 10:00 PM. Equipment not returned by the agreed return time will be marked as overdue. Repeated late returns may result in temporary suspension of your borrowing privileges for a period determined by laboratory staff.',
                 ),
                 _TermsSection(
                   number: '5',

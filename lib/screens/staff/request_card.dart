@@ -16,22 +16,52 @@ import '../../services/api_service.dart';
 import '../../services/session.dart';
 import '../../theme.dart';
 import '../../widgets/common.dart';
+import 'loan_card.dart' show changeReturnTime;
 
-class PendingRequestCard extends StatelessWidget {
+class PendingRequestCard extends StatefulWidget {
   // The records of one request (see ApiService.groupRequests).
   final List<dynamic> request;
-  final VoidCallback onApprove;
-  final VoidCallback onReject;
+  final Future<void> Function() onApprove;
+  final Future<void> Function() onReject;
+  // After the return time is changed (the Dashboard reloads its list).
+  final VoidCallback? onChanged;
   const PendingRequestCard(
-      {super.key, required this.request, required this.onApprove, required this.onReject});
+      {super.key, required this.request, required this.onApprove, required this.onReject,
+      this.onChanged});
+
+  @override
+  State<PendingRequestCard> createState() => _PendingRequestCardState();
+}
+
+class _PendingRequestCardState extends State<PendingRequestCard> {
+  // Approving a request of several units takes a few seconds (one unit at a
+  // time, longer when a unit has to be swapped), and the buttons stayed live
+  // meanwhile, so a second tap started a second run (QA 2026-10-06).
+  String? _busy; // 'approve' or 'reject' while one is running
+
+  Future<void> _run(String which, Future<void> Function() action) async {
+    if (_busy != null) return;
+    setState(() => _busy = which);
+    try {
+      await action();
+    } finally {
+      if (mounted) setState(() => _busy = null);
+    }
+  }
+
+  Widget _spinner(Color color) => SizedBox(
+      width: 16, height: 16,
+      child: CircularProgressIndicator(strokeWidth: 2, color: color));
 
   @override
   Widget build(BuildContext context) {
+    final request = widget.request;
     final first   = request.first;
     // Always Strings, whatever the record holds (QA 2026-10-03).
     final name    = '${first['borrower_name'] ?? first['student_number'] ?? 'Student'}';
     final number  = '${first['student_number'] ?? ''}';
     final subject = '${first['subject'] ?? ''}'.trim();
+    final where   = '${first['use_location'] ?? ''}'.trim();
     final purpose = '${first['purpose'] ?? ''}'.trim();
     final due     = ApiService.asDate(first['due_date']);
     final codes   = [for (final t in request) '${t['qr_code'] ?? ''}']
@@ -92,19 +122,47 @@ class PendingRequestCard extends StatelessWidget {
 
         // Why, and until when.
         if (subject.isNotEmpty) _line(Icons.menu_book_outlined, 'Subject: $subject'),
+        if (where.isNotEmpty) _line(Icons.place_outlined, 'Where: $where'),
         if (purpose.isNotEmpty) _line(Icons.notes_rounded, 'Purpose: $purpose'),
+        // Staff can give a later time than the student asked for (10:00 PM
+        // is the usual latest, 2026-10-06).
         if (due != null)
-          _line(Icons.timer_outlined,
-              'Return by ${TimeOfDay.fromDateTime(due).format(context)}, ${formatDate(due)}'),
+          Row(children: [
+            Expanded(
+              child: _line(Icons.timer_outlined,
+                  'Return by ${TimeOfDay.fromDateTime(due).format(context)}, ${formatDate(due)}'),
+            ),
+            if (Session.canManage)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: TextButton(
+                  onPressed: _busy != null
+                      ? null
+                      : () async {
+                          if (await changeReturnTime(context, request)) {
+                            widget.onChanged?.call();
+                          }
+                        },
+                  style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8)),
+                  child: const Text('Change'),
+                ),
+              ),
+          ]),
 
         if (Session.canManage) ...[
           const SizedBox(height: 12),
           const Divider(color: AppTheme.divider, height: 1),
           const SizedBox(height: 10),
-          Row(children: [
+          // The two buttons as one row of equal height (the theme makes the
+          // filled one taller than the outlined one).
+          IntrinsicHeight(child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Expanded(child: OutlinedButton.icon(
-              onPressed: onReject,
-              icon: const Icon(Icons.close_rounded, size: 16),
+              onPressed: _busy != null ? null : () => _run('reject', widget.onReject),
+              icon: _busy == 'reject'
+                  ? _spinner(AppTheme.danger)
+                  : const Icon(Icons.close_rounded, size: 16),
               label: const Text('Deny'),
               style: OutlinedButton.styleFrom(
                   foregroundColor: AppTheme.danger,
@@ -112,12 +170,24 @@ class PendingRequestCard extends StatelessWidget {
             )),
             const SizedBox(width: 10),
             Expanded(child: ElevatedButton.icon(
-              onPressed: onApprove,
-              icon: const Icon(Icons.check_rounded, size: 16),
-              label: Text(request.length > 1 ? 'Approve all ${request.length}' : 'Approve'),
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
+              onPressed: _busy != null ? null : () => _run('approve', widget.onApprove),
+              icon: _busy == 'approve'
+                  ? _spinner(Colors.white)
+                  : const Icon(Icons.check_rounded, size: 16),
+              // One line: "Approve all 3" used to wrap onto
+              // two lines on a phone (QA 2026-10-06).
+              label: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(request.length > 1 ? 'Approve all ${request.length}' : 'Approve',
+                    maxLines: 1),
+              ),
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.success,
+                  // Keep the green while busy; it is disabled, not gone.
+                  disabledBackgroundColor: AppTheme.success.withValues(alpha: 0.6),
+                  disabledForegroundColor: Colors.white),
             )),
-          ]),
+          ])),
         ],
       ]),
     );

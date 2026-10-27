@@ -50,9 +50,10 @@ class _DamageReportScreenState extends State<DamageReportScreen> {
         studentId: Session.currentUser?['student_id'],
         studentNumber: Session.studentNumber,
       );
-      // Only Approved (currently borrowed) items
+      // Only items in the student's hands: approved and handed over. One
+      // still waiting at the lab cannot have been damaged by them (2026-10-06).
       final active = loans
-          .where((e) => e['status'] == 'Approved')
+          .where(ApiService.isOut)
           .map<Map<String, dynamic>>((e) => {
                 'equipment_id':   '${e['equipment_id'] ?? ''}',
                 'equipment_name': '${e['equipment_name'] ?? 'Unknown'}',

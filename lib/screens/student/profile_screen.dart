@@ -17,6 +17,7 @@ import 'about_screen.dart';
 import 'change_password_screen.dart';
 import 'edit_profile_screen.dart';
 import 'help_faq_screen.dart';
+import 'how_it_works_screen.dart';
 import 'lab_policies_screen.dart';
 import 'notifications_settings_screen.dart';
 
@@ -173,6 +174,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   // ── Support ──
                   const SectionHeader(title: 'Support'),
                   const SizedBox(height: 12),
+                  _SettingTile(
+                    icon: Icons.lightbulb_outline_rounded,
+                    label: 'How Borrowing Works',
+                    onTap: () => Navigator.push(context,
+                        MaterialPageRoute(builder: (_) => const HowItWorksScreen())),
+                  ),
                   _SettingTile(
                     icon: Icons.policy_rounded,
                     label: 'Laboratory Policies',
